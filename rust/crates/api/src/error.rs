@@ -4,7 +4,10 @@ use std::time::Duration;
 
 #[derive(Debug)]
 pub enum ApiError {
-    MissingApiKey,
+    MissingCredentials {
+        provider: &'static str,
+        env_vars: &'static [&'static str],
+    },
     ExpiredOAuthToken,
     Auth(String),
     InvalidApiKeyEnv(VarError),
@@ -31,12 +34,20 @@ pub enum ApiError {
 
 impl ApiError {
     #[must_use]
+    pub const fn missing_credentials(
+        provider: &'static str,
+        env_vars: &'static [&'static str],
+    ) -> Self {
+        Self::MissingCredentials { provider, env_vars }
+    }
+
+    #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Http(error) => error.is_connect() || error.is_timeout() || error.is_request(),
             Self::Api { retryable, .. } => *retryable,
             Self::RetriesExhausted { last_error, .. } => last_error.is_retryable(),
-            Self::MissingApiKey
+            Self::MissingCredentials { .. }
             | Self::ExpiredOAuthToken
             | Self::Auth(_)
             | Self::InvalidApiKeyEnv(_)
@@ -51,12 +62,11 @@ impl ApiError {
 impl Display for ApiError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::MissingApiKey => {
-                write!(
-                    f,
-                    "ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY is not set; export one before calling the Anthropic API"
-                )
-            }
+            Self::MissingCredentials { provider, env_vars } => write!(
+                f,
+                "missing {provider} credentials; export {} before calling the {provider} API",
+                env_vars.join(" or ")
+            ),
             Self::ExpiredOAuthToken => {
                 write!(
                     f,
@@ -65,10 +75,7 @@ impl Display for ApiError {
             }
             Self::Auth(message) => write!(f, "auth error: {message}"),
             Self::InvalidApiKeyEnv(error) => {
-                write!(
-                    f,
-                    "failed to read ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY: {error}"
-                )
+                write!(f, "failed to read credential environment variable: {error}")
             }
             Self::Http(error) => write!(f, "http error: {error}"),
             Self::Io(error) => write!(f, "io error: {error}"),
@@ -81,20 +88,14 @@ impl Display for ApiError {
                 ..
             } => match (error_type, message) {
                 (Some(error_type), Some(message)) => {
-                    write!(
-                        f,
-                        "anthropic api returned {status} ({error_type}): {message}"
-                    )
+                    write!(f, "api returned {status} ({error_type}): {message}")
                 }
-                _ => write!(f, "anthropic api returned {status}: {body}"),
+                _ => write!(f, "api returned {status}: {body}"),
             },
             Self::RetriesExhausted {
                 attempts,
                 last_error,
-            } => write!(
-                f,
-                "anthropic api failed after {attempts} attempts: {last_error}"
-            ),
+            } => write!(f, "api failed after {attempts} attempts: {last_error}"),
             Self::InvalidSseFrame(message) => write!(f, "invalid sse frame: {message}"),
             Self::BackoffOverflow {
                 attempt,
