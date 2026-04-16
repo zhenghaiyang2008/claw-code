@@ -15,10 +15,11 @@ use runtime::{
     grep_search, load_system_prompt,
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
+    mode_state::{ModeStateRecord, ModeStateStore},
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
     read_file,
     summary_compression::compress_summary_text,
-    task_registry::TaskRegistry,
+    task_registry::{TaskRegistry, TaskRuntimeMetadata},
     team_cron_registry::{CronRegistry, TeamRegistry},
     worker_boot::{WorkerReadySnapshot, WorkerRegistry, WorkerTaskReceipt},
     write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
@@ -56,10 +57,21 @@ fn global_cron_registry() -> &'static CronRegistry {
     REGISTRY.get_or_init(CronRegistry::new)
 }
 
-fn global_task_registry() -> &'static TaskRegistry {
-    use std::sync::OnceLock;
-    static REGISTRY: OnceLock<TaskRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(TaskRegistry::new)
+fn current_workspace_task_registry() -> Result<TaskRegistry, String> {
+    use std::sync::{Mutex, OnceLock};
+
+    static REGISTRIES: OnceLock<Mutex<BTreeMap<PathBuf, TaskRegistry>>> = OnceLock::new();
+
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+    let registries = REGISTRIES.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut registries = registries
+        .lock()
+        .map_err(|_| String::from("task registry cache lock poisoned"))?;
+    Ok(registries
+        .entry(cwd.clone())
+        .or_insert_with(|| TaskRegistry::for_workspace(cwd))
+        .clone())
 }
 
 fn global_worker_registry() -> &'static WorkerRegistry {
@@ -750,7 +762,16 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "prompt": { "type": "string" },
-                    "description": { "type": "string" }
+                    "description": { "type": "string" },
+                    "session_id": { "type": "string" },
+                    "dependencies": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "artifacts": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    }
                 },
                 "required": ["prompt"],
                 "additionalProperties": false
@@ -1376,24 +1397,33 @@ fn run_ask_user_question(input: AskUserQuestionInput) -> Result<String, String> 
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_task_create(input: TaskCreateInput) -> Result<String, String> {
-    let registry = global_task_registry();
-    let task = registry.create(&input.prompt, input.description.as_deref());
+    let registry = current_workspace_task_registry()?;
+    let task = registry.create_with_metadata(
+        &input.prompt,
+        input.description.as_deref(),
+        TaskRuntimeMetadata {
+            session_id: input.session_id,
+            dependencies: input.dependencies,
+            artifacts: input.artifacts,
+        },
+    )?;
     to_pretty_json(json!({
         "task_id": task.task_id,
         "status": task.status,
         "prompt": task.prompt,
         "description": task.description,
         "task_packet": task.task_packet,
-        "created_at": task.created_at
+        "created_at": task.created_at,
+        "session_id": task.session_id,
+        "dependencies": task.dependencies,
+        "artifacts": task.artifacts
     }))
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_task_packet(input: TaskPacket) -> Result<String, String> {
-    let registry = global_task_registry();
-    let task = registry
-        .create_from_packet(input)
-        .map_err(|error| error.to_string())?;
+    let registry = current_workspace_task_registry()?;
+    let task = registry.try_create_from_packet(input)?;
 
     to_pretty_json(json!({
         "task_id": task.task_id,
@@ -1401,14 +1431,17 @@ fn run_task_packet(input: TaskPacket) -> Result<String, String> {
         "prompt": task.prompt,
         "description": task.description,
         "task_packet": task.task_packet,
-        "created_at": task.created_at
+        "created_at": task.created_at,
+        "session_id": task.session_id,
+        "dependencies": task.dependencies,
+        "artifacts": task.artifacts
     }))
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_task_get(input: TaskIdInput) -> Result<String, String> {
-    let registry = global_task_registry();
-    match registry.get(&input.task_id) {
+    let registry = current_workspace_task_registry()?;
+    match registry.try_get(&input.task_id)? {
         Some(task) => to_pretty_json(json!({
             "task_id": task.task_id,
             "status": task.status,
@@ -1418,16 +1451,19 @@ fn run_task_get(input: TaskIdInput) -> Result<String, String> {
             "created_at": task.created_at,
             "updated_at": task.updated_at,
             "messages": task.messages,
-            "team_id": task.team_id
+            "team_id": task.team_id,
+            "session_id": task.session_id,
+            "dependencies": task.dependencies,
+            "artifacts": task.artifacts
         })),
         None => Err(format!("task not found: {}", input.task_id)),
     }
 }
 
 fn run_task_list(_input: Value) -> Result<String, String> {
-    let registry = global_task_registry();
+    let registry = current_workspace_task_registry()?;
     let tasks: Vec<_> = registry
-        .list(None)
+        .try_list(None)?
         .into_iter()
         .map(|t| {
             json!({
@@ -1438,7 +1474,10 @@ fn run_task_list(_input: Value) -> Result<String, String> {
                 "task_packet": t.task_packet,
                 "created_at": t.created_at,
                 "updated_at": t.updated_at,
-                "team_id": t.team_id
+                "team_id": t.team_id,
+                "session_id": t.session_id,
+                "dependencies": t.dependencies,
+                "artifacts": t.artifacts
             })
         })
         .collect();
@@ -1450,12 +1489,17 @@ fn run_task_list(_input: Value) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_task_stop(input: TaskIdInput) -> Result<String, String> {
-    let registry = global_task_registry();
+    let registry = current_workspace_task_registry()?;
     match registry.stop(&input.task_id) {
         Ok(task) => to_pretty_json(json!({
             "task_id": task.task_id,
             "status": task.status,
-            "message": "Task stopped"
+            "message": "Task stopped",
+            "session_id": task.session_id,
+            "dependencies": task.dependencies,
+            "artifacts": task.artifacts,
+            "team_id": task.team_id,
+            "updated_at": task.updated_at
         })),
         Err(e) => Err(e),
     }
@@ -1463,13 +1507,18 @@ fn run_task_stop(input: TaskIdInput) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_task_update(input: TaskUpdateInput) -> Result<String, String> {
-    let registry = global_task_registry();
+    let registry = current_workspace_task_registry()?;
     match registry.update(&input.task_id, &input.message) {
         Ok(task) => to_pretty_json(json!({
             "task_id": task.task_id,
             "status": task.status,
             "message_count": task.messages.len(),
-            "last_message": input.message
+            "last_message": input.message,
+            "session_id": task.session_id,
+            "dependencies": task.dependencies,
+            "artifacts": task.artifacts,
+            "team_id": task.team_id,
+            "updated_at": task.updated_at
         })),
         Err(e) => Err(e),
     }
@@ -1477,14 +1526,19 @@ fn run_task_update(input: TaskUpdateInput) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_task_output(input: TaskIdInput) -> Result<String, String> {
-    let registry = global_task_registry();
-    match registry.output(&input.task_id) {
-        Ok(output) => to_pretty_json(json!({
-            "task_id": input.task_id,
-            "output": output,
-            "has_output": !output.is_empty()
+    let registry = current_workspace_task_registry()?;
+    match registry.try_get(&input.task_id)? {
+        Some(task) => to_pretty_json(json!({
+            "task_id": task.task_id,
+            "output": task.output,
+            "has_output": !task.output.is_empty(),
+            "session_id": task.session_id,
+            "dependencies": task.dependencies,
+            "artifacts": task.artifacts,
+            "team_id": task.team_id,
+            "updated_at": task.updated_at
         })),
-        Err(e) => Err(e),
+        None => Err(format!("task not found: {}", input.task_id)),
     }
 }
 
@@ -1574,10 +1628,28 @@ fn run_team_create(input: TeamCreateInput) -> Result<String, String> {
         .iter()
         .filter_map(|t| t.get("task_id").and_then(|v| v.as_str()).map(str::to_owned))
         .collect();
+    let task_registry = current_workspace_task_registry()?;
+    for task_id in &task_ids {
+        if task_registry.try_get(task_id)?.is_none() {
+            return Err(format!("task not found: {task_id}"));
+        }
+    }
+
     let team = global_team_registry().create(&input.name, task_ids);
+    let mut assigned_task_ids: Vec<String> = Vec::new();
     // Register team assignment on each task
     for task_id in &team.task_ids {
-        let _ = global_task_registry().assign_team(task_id, &team.team_id);
+        if let Err(error) = task_registry.assign_team(task_id, &team.team_id) {
+            for assigned_task_id in &assigned_task_ids {
+                let _ = task_registry.unassign_team(assigned_task_id);
+            }
+            let _ = global_team_registry().delete(&team.team_id);
+            return Err(format!(
+                "failed to assign task {task_id} to team {}: {error}",
+                team.team_id
+            ));
+        }
+        assigned_task_ids.push(task_id.clone());
     }
     to_pretty_json(json!({
         "team_id": team.team_id,
@@ -2413,6 +2485,12 @@ struct TaskCreateInput {
     prompt: String,
     #[serde(default)]
     description: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    dependencies: Vec<String>,
+    #[serde(default)]
+    artifacts: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5830,14 +5908,63 @@ fn remove_nested_value(root: &mut serde_json::Map<String, Value>, path: &[&str])
 }
 
 fn plan_mode_state_file() -> Result<PathBuf, String> {
-    Ok(config_file_for_scope(ConfigScope::Settings)?
-        .parent()
-        .ok_or_else(|| String::from("settings.local.json has no parent directory"))?
+    Ok(plan_mode_state_store().mode_path("plan", None))
+}
+
+fn read_plan_mode_state(path: &Path) -> Result<Option<PlanModeState>, String> {
+    if let Some(state) = plan_mode_state_store()
+        .read("plan", None)
+        .map_err(|error| error.to_string())?
+        .map(|record| serde_json::from_value(record.context).map_err(|error| error.to_string()))
+        .transpose()?
+    {
+        clear_legacy_plan_mode_state()?;
+        return Ok(Some(state));
+    }
+
+    let legacy_path = legacy_plan_mode_state_file()?;
+    let legacy_state = read_legacy_plan_mode_state(&legacy_path)?;
+    if let Some(state) = legacy_state {
+        write_plan_mode_state(path, &state)?;
+        clear_legacy_plan_mode_state()?;
+        return Ok(Some(state));
+    }
+
+    Ok(None)
+}
+
+fn write_plan_mode_state(_path: &Path, state: &PlanModeState) -> Result<(), String> {
+    let mut record = ModeStateRecord::new("plan", true);
+    record.current_phase = Some(String::from("active"));
+    record.context = serde_json::to_value(state).map_err(|error| error.to_string())?;
+    plan_mode_state_store()
+        .write(&record)
+        .map(|_| ())
+        .map_err(|error| error.to_string())?;
+    clear_legacy_plan_mode_state()
+}
+
+fn clear_plan_mode_state(_path: &Path) -> Result<(), String> {
+    plan_mode_state_store()
+        .clear("plan", None)
+        .map(|_| ())
+        .map_err(|error| error.to_string())?;
+    clear_legacy_plan_mode_state()
+}
+
+fn plan_mode_state_store() -> ModeStateStore {
+    ModeStateStore::new()
+}
+
+fn legacy_plan_mode_state_file() -> Result<PathBuf, String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    Ok(cwd
+        .join(".claw")
         .join("tool-state")
         .join("plan-mode.json"))
 }
 
-fn read_plan_mode_state(path: &Path) -> Result<Option<PlanModeState>, String> {
+fn read_legacy_plan_mode_state(path: &Path) -> Result<Option<PlanModeState>, String> {
     match std::fs::read_to_string(path) {
         Ok(contents) => {
             if contents.trim().is_empty() {
@@ -5852,20 +5979,15 @@ fn read_plan_mode_state(path: &Path) -> Result<Option<PlanModeState>, String> {
     }
 }
 
-fn write_plan_mode_state(path: &Path, state: &PlanModeState) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-    std::fs::write(
-        path,
-        serde_json::to_string_pretty(state).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())
-}
-
-fn clear_plan_mode_state(path: &Path) -> Result<(), String> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
+fn clear_legacy_plan_mode_state() -> Result<(), String> {
+    let path = legacy_plan_mode_state_file()?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
+            Ok(())
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.to_string()),
     }
@@ -6130,8 +6252,10 @@ mod tests {
         derive_agent_state, execute_agent_with_spawn, execute_tool, extract_recovery_outcome,
         final_assistant_text, global_cron_registry, maybe_commit_provenance, mvp_tool_specs,
         permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
-        run_task_packet, AgentInput, AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass,
-        ProviderRuntimeClient, SubagentToolExecutor,
+        run_task_create, run_task_get, run_task_output, run_task_packet, run_task_update,
+        AgentInput, AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass,
+        ProviderRuntimeClient, SubagentToolExecutor, TaskCreateInput, TaskIdInput,
+        TaskUpdateInput,
     };
     use api::OutputContentBlock;
     use runtime::ProviderFallbackConfig;
@@ -9074,9 +9198,8 @@ mod tests {
         let local_settings = std::fs::read_to_string(cwd.join(".claw").join("settings.local.json"))
             .expect("local settings after enter");
         assert!(local_settings.contains(r#""defaultMode": "plan""#));
-        let state =
-            std::fs::read_to_string(cwd.join(".claw").join("tool-state").join("plan-mode.json"))
-                .expect("plan mode state");
+        let state = std::fs::read_to_string(cwd.join(".omx").join("state").join("plan-state.json"))
+            .expect("plan mode state");
         assert!(state.contains(r#""hadLocalOverride": true"#));
         assert!(state.contains(r#""previousLocalMode": "acceptEdits""#));
 
@@ -9091,9 +9214,9 @@ mod tests {
             .expect("local settings after exit");
         assert!(local_settings.contains(r#""defaultMode": "acceptEdits""#));
         assert!(!cwd
-            .join(".claw")
-            .join("tool-state")
-            .join("plan-mode.json")
+            .join(".omx")
+            .join("state")
+            .join("plan-state.json")
             .exists());
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
@@ -9152,10 +9275,72 @@ mod tests {
             "permissions override should be removed on exit"
         );
         assert!(!cwd
+            .join(".omx")
+            .join("state")
+            .join("plan-state.json")
+            .exists());
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn exit_plan_mode_migrates_and_clears_legacy_plan_mode_state() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "clawd-plan-mode-legacy-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let home = root.join("home");
+        let cwd = root.join("cwd");
+        std::fs::create_dir_all(home.join(".claw")).expect("home dir");
+        std::fs::create_dir_all(cwd.join(".claw").join("tool-state")).expect("cwd dir");
+        std::fs::write(
+            cwd.join(".claw").join("settings.local.json"),
+            r#"{"permissions":{"defaultMode":"plan"}}"#,
+        )
+        .expect("write local settings");
+        std::fs::write(
+            cwd.join(".claw").join("tool-state").join("plan-mode.json"),
+            r#"{"hadLocalOverride":true,"previousLocalMode":"acceptEdits"}"#,
+        )
+        .expect("write legacy plan mode state");
+
+        let original_home = std::env::var("HOME").ok();
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::set_current_dir(&cwd).expect("set cwd");
+
+        let exit = execute_tool("ExitPlanMode", &json!({})).expect("exit plan mode");
+        let exit_output: serde_json::Value = serde_json::from_str(&exit).expect("json");
+        assert_eq!(exit_output["changed"], true);
+        assert_eq!(exit_output["previousLocalMode"], "acceptEdits");
+        assert_eq!(exit_output["currentLocalMode"], "acceptEdits");
+        assert!(!cwd
             .join(".claw")
             .join("tool-state")
             .join("plan-mode.json")
             .exists());
+        assert!(!cwd.join(".omx").join("state").join("plan-state.json").exists());
+
+        let local_settings = std::fs::read_to_string(cwd.join(".claw").join("settings.local.json"))
+            .expect("local settings after exit");
+        assert!(local_settings.contains(r#""defaultMode": "acceptEdits""#));
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         match original_home {
@@ -9574,10 +9759,178 @@ printf 'pwsh:%s' "$1"
         assert_eq!(output["prompt"], "Ship packetized runtime task");
         assert_eq!(output["description"], "runtime/task system");
         assert_eq!(output["task_packet"]["repo"], "claw-code-parity");
+        assert!(looks_like_rfc3339(
+            output["created_at"].as_str().expect("created_at string")
+        ));
+        assert!(output["session_id"].is_null());
+        assert_eq!(output["dependencies"], json!([]));
+        assert_eq!(output["artifacts"], json!([]));
         assert_eq!(
             output["task_packet"]["acceptance_tests"][1],
             "cargo test --workspace"
         );
+    }
+
+    #[test]
+    fn run_task_create_emits_persisted_runtime_metadata_fields() {
+        let result = run_task_create(TaskCreateInput {
+            prompt: "Recover persisted runtime task".to_string(),
+            description: Some("mode state handoff".to_string()),
+            session_id: Some("session-tools".to_string()),
+            dependencies: vec!["task_seed".to_string()],
+            artifacts: vec![".omx/specs/runtime.md".to_string()],
+        })
+        .expect("task create should succeed");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
+        assert_eq!(output["prompt"], "Recover persisted runtime task");
+        assert_eq!(output["session_id"], "session-tools");
+        assert_eq!(output["dependencies"], json!(["task_seed"]));
+        assert_eq!(output["artifacts"], json!([".omx/specs/runtime.md"]));
+        assert!(looks_like_rfc3339(
+            output["created_at"].as_str().expect("created_at string")
+        ));
+    }
+
+    #[test]
+    fn run_task_get_and_output_emit_rfc3339_timestamps() {
+        let created = run_task_create(TaskCreateInput {
+            prompt: "Inspect persisted task timestamps".to_string(),
+            description: Some("timestamp compliance".to_string()),
+            session_id: None,
+            dependencies: Vec::new(),
+            artifacts: Vec::new(),
+        })
+        .expect("task create should succeed");
+
+        let created_json: serde_json::Value = serde_json::from_str(&created).expect("json");
+        let task_id = created_json["task_id"]
+            .as_str()
+            .expect("task_id string")
+            .to_string();
+
+        let updated = run_task_update(TaskUpdateInput {
+            task_id: task_id.clone(),
+            message: "hello".to_string(),
+        })
+        .expect("task update should succeed");
+        let updated_json: serde_json::Value = serde_json::from_str(&updated).expect("json");
+        assert!(looks_like_rfc3339(
+            updated_json["updated_at"]
+                .as_str()
+                .expect("updated_at string")
+        ));
+
+        let fetched = run_task_get(TaskIdInput {
+            task_id: task_id.clone(),
+        })
+        .expect("task get should succeed");
+        let fetched_json: serde_json::Value = serde_json::from_str(&fetched).expect("json");
+        assert!(looks_like_rfc3339(
+            fetched_json["created_at"]
+                .as_str()
+                .expect("created_at string")
+        ));
+        assert!(looks_like_rfc3339(
+            fetched_json["updated_at"]
+                .as_str()
+                .expect("updated_at string")
+        ));
+        assert!(looks_like_rfc3339(
+            fetched_json["messages"][0]["timestamp"]
+                .as_str()
+                .expect("message timestamp string")
+        ));
+
+        let output = run_task_output(TaskIdInput { task_id })
+            .expect("task output should succeed");
+        let output_json: serde_json::Value = serde_json::from_str(&output).expect("json");
+        assert!(looks_like_rfc3339(
+            output_json["updated_at"]
+                .as_str()
+                .expect("updated_at string")
+        ));
+    }
+
+    #[test]
+    fn task_tools_resolve_registry_per_current_workspace() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "clawd-task-workspaces-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let workspace_a = root.join("a");
+        let workspace_b = root.join("b");
+        std::fs::create_dir_all(&workspace_a).expect("workspace a");
+        std::fs::create_dir_all(&workspace_b).expect("workspace b");
+
+        let original_dir = std::env::current_dir().expect("cwd");
+
+        std::env::set_current_dir(&workspace_a).expect("set workspace a");
+        let first = run_task_create(TaskCreateInput {
+            prompt: "workspace a task".to_string(),
+            description: None,
+            session_id: None,
+            dependencies: Vec::new(),
+            artifacts: Vec::new(),
+        })
+        .expect("create in workspace a");
+        let first_json: serde_json::Value = serde_json::from_str(&first).expect("json");
+        let first_id = first_json["task_id"].as_str().expect("task id").to_string();
+
+        std::env::set_current_dir(&workspace_b).expect("set workspace b");
+        let second = run_task_create(TaskCreateInput {
+            prompt: "workspace b task".to_string(),
+            description: None,
+            session_id: None,
+            dependencies: Vec::new(),
+            artifacts: Vec::new(),
+        })
+        .expect("create in workspace b");
+        let second_json: serde_json::Value = serde_json::from_str(&second).expect("json");
+        let second_id = second_json["task_id"].as_str().expect("task id").to_string();
+
+        let registry_a = runtime::TaskRegistry::for_workspace(&workspace_a);
+        let registry_b = runtime::TaskRegistry::for_workspace(&workspace_b);
+        assert!(registry_a.get(&first_id).is_some());
+        assert!(registry_a.get(&second_id).is_none());
+        assert!(registry_b.get(&second_id).is_some());
+        assert!(registry_b.get(&first_id).is_none());
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_team_create_rejects_missing_task_before_creating_team() {
+        let before = crate::global_team_registry().len();
+        let error = crate::run_team_create(crate::TeamCreateInput {
+            name: "milestone-one".to_string(),
+            tasks: vec![json!({ "task_id": "missing-task" })],
+        })
+        .expect_err("missing task should reject team creation");
+
+        assert_eq!(error, "invalid task id: missing-task");
+        assert_eq!(
+            crate::global_team_registry().len(),
+            before,
+            "team count should not change on pre-validation failure"
+        );
+    }
+
+    fn looks_like_rfc3339(value: &str) -> bool {
+        value.len() == 20
+            && value.as_bytes()[4] == b'-'
+            && value.as_bytes()[7] == b'-'
+            && value.as_bytes()[10] == b'T'
+            && value.as_bytes()[13] == b':'
+            && value.as_bytes()[16] == b':'
+            && value.as_bytes()[19] == b'Z'
     }
 
     struct TestServer {

@@ -25,6 +25,7 @@ pub mod mcp_lifecycle_hardened;
 pub mod mcp_server;
 mod mcp_stdio;
 pub mod mcp_tool_bridge;
+pub mod mode_state;
 mod oauth;
 pub mod permission_enforcer;
 mod permissions;
@@ -108,6 +109,7 @@ pub use mcp_stdio::{
     McpTool, McpToolCallContent, McpToolCallParams, McpToolCallResult, McpToolDiscoveryReport,
     UnsupportedMcpServer,
 };
+pub use mode_state::{ModeStateError, ModeStateRecord, ModeStateStore, ModeStateSummary};
 pub use oauth::{
     clear_oauth_credentials, code_challenge_s256, credentials_path, generate_pkce_pair,
     generate_state, load_oauth_credentials, loopback_redirect_uri, parse_oauth_callback_query,
@@ -160,6 +162,7 @@ pub use stale_branch::{
     StaleBranchPolicy,
 };
 pub use task_packet::{validate_packet, TaskPacket, TaskPacketValidationError, ValidatedPacket};
+pub use task_registry::{Task, TaskMessage, TaskRegistry, TaskRuntimeMetadata, TaskStatus};
 #[cfg(test)]
 pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver};
 pub use usage::{
