@@ -12,6 +12,7 @@ mod compact;
 mod config;
 pub mod config_validate;
 mod conversation;
+pub mod deep_interview;
 mod file_ops;
 mod git_context;
 pub mod green_contract;
@@ -73,6 +74,12 @@ pub use conversation::{
     auto_compaction_threshold_from_env, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
     ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolError,
     ToolExecutor, TurnSummary,
+};
+pub use deep_interview::{
+    append_deep_interview_round, initialize_deep_interview_session, materialize_deep_interview_spec,
+    read_deep_interview_state, DeepInterviewAppendRequest, DeepInterviewAmbiguity,
+    DeepInterviewError, DeepInterviewInitRequest, DeepInterviewRound, DeepInterviewSessionArtifact,
+    DeepInterviewState, DEEP_INTERVIEW_MODE,
 };
 pub use file_ops::{
     edit_file, glob_search, grep_search, read_file, write_file, EditFileOutput, GlobSearchOutput,

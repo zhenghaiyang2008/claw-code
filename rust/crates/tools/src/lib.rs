@@ -11,8 +11,10 @@ use api::{
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
-    check_freshness, dedupe_superseded_commit_events, edit_file, execute_bash, glob_search,
-    grep_search, load_system_prompt,
+    append_deep_interview_round, check_freshness, dedupe_superseded_commit_events,
+    deep_interview::DeepInterviewSessionArtifact, initialize_deep_interview_session,
+    read_deep_interview_state, DeepInterviewAppendRequest, DeepInterviewInitRequest,
+    DEEP_INTERVIEW_MODE, edit_file, execute_bash, glob_search, grep_search, load_system_prompt,
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     mode_state::{ModeStateRecord, ModeStateStore},
@@ -756,6 +758,52 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
+            name: "DeepInterviewInit",
+            description: "Initialize a persisted deep-interview session and write its handoff spec artifact.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "initial_idea": { "type": "string" },
+                    "interview_id": { "type": "string" },
+                    "current_ambiguity": { "type": "number", "minimum": 0.0 },
+                    "threshold": { "type": "number", "minimum": 0.0 }
+                },
+                "required": ["initial_idea"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "DeepInterviewAppendRound",
+            description: "Append a question/answer round to a persisted deep-interview session and refresh its handoff spec artifact.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "interview_id": { "type": "string" },
+                    "question": { "type": "string" },
+                    "answer": { "type": "string" },
+                    "ambiguity_after": { "type": "number", "minimum": 0.0 },
+                    "ambiguity_before": { "type": "number", "minimum": 0.0 },
+                    "note": { "type": "string" }
+                },
+                "required": ["interview_id", "question", "answer", "ambiguity_after"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "DeepInterviewGet",
+            description: "Read back the current persisted deep-interview session state.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "interview_id": { "type": "string" }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
             name: "TaskCreate",
             description: "Create a background task that runs in a separate subprocess.",
             input_schema: json!({
@@ -1270,6 +1318,18 @@ fn execute_tool_with_enforcer(
         "AskUserQuestion" => {
             from_value::<AskUserQuestionInput>(input).and_then(run_ask_user_question)
         }
+        "DeepInterviewInit" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<DeepInterviewInitInput>(input).and_then(run_deep_interview_init)
+        }
+        "DeepInterviewAppendRound" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<DeepInterviewAppendRoundInput>(input)
+                .and_then(run_deep_interview_append_round)
+        }
+        "DeepInterviewGet" => {
+            from_value::<DeepInterviewGetInput>(input).and_then(run_deep_interview_get)
+        }
         "TaskCreate" => from_value::<TaskCreateInput>(input).and_then(run_task_create),
         "RunTaskPacket" => from_value::<TaskPacket>(input).and_then(run_task_packet),
         "TaskGet" => from_value::<TaskIdInput>(input).and_then(run_task_get),
@@ -1396,6 +1456,54 @@ fn run_ask_user_question(input: AskUserQuestionInput) -> Result<String, String> 
 }
 
 #[allow(clippy::needless_pass_by_value)]
+fn run_deep_interview_init(input: DeepInterviewInitInput) -> Result<String, String> {
+    let store = deep_interview_mode_state_store();
+    let artifact = initialize_deep_interview_session(
+        &store,
+        DeepInterviewInitRequest {
+            interview_id: input.interview_id,
+            initial_idea: input.initial_idea,
+            current_ambiguity: input.current_ambiguity,
+            threshold: input.threshold,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    deep_interview_tool_output("initialized", artifact)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_deep_interview_append_round(input: DeepInterviewAppendRoundInput) -> Result<String, String> {
+    let store = deep_interview_mode_state_store();
+    let artifact = append_deep_interview_round(
+        &store,
+        DeepInterviewAppendRequest {
+            interview_id: input.interview_id,
+            question: input.question,
+            answer: input.answer,
+            ambiguity_after: input.ambiguity_after,
+            ambiguity_before: input.ambiguity_before,
+            note: input.note,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    deep_interview_tool_output("updated", artifact)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_deep_interview_get(input: DeepInterviewGetInput) -> Result<String, String> {
+    let store = deep_interview_mode_state_store();
+    let state = read_deep_interview_state(&store, input.interview_id.as_deref())
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| String::from("deep interview session not found"))?;
+    to_pretty_json(json!({
+        "status": "ok",
+        "mode": DEEP_INTERVIEW_MODE,
+        "ask_user_question_tool": "AskUserQuestion",
+        "state": state,
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
 fn run_task_create(input: TaskCreateInput) -> Result<String, String> {
     let registry = current_workspace_task_registry()?;
     let task = registry.create_with_metadata(
@@ -1417,6 +1525,25 @@ fn run_task_create(input: TaskCreateInput) -> Result<String, String> {
         "session_id": task.session_id,
         "dependencies": task.dependencies,
         "artifacts": task.artifacts
+    }))
+}
+
+fn deep_interview_tool_output(
+    status: &str,
+    artifact: DeepInterviewSessionArtifact,
+) -> Result<String, String> {
+    to_pretty_json(json!({
+        "status": status,
+        "mode": DEEP_INTERVIEW_MODE,
+        "interview_id": artifact.state.interview_id,
+        "ask_user_question_tool": "AskUserQuestion",
+        "state": artifact.state,
+        "spec": {
+            "output_path": artifact.state.output_spec_path,
+            "handoff_path": artifact.state.handoff_path,
+            "file_path": artifact.spec_output.file_path,
+            "kind": artifact.spec_output.kind,
+        }
     }))
 }
 
@@ -2481,6 +2608,35 @@ struct AskUserQuestionInput {
 }
 
 #[derive(Debug, Deserialize)]
+struct DeepInterviewInitInput {
+    initial_idea: String,
+    #[serde(default)]
+    interview_id: Option<String>,
+    #[serde(default = "default_deep_interview_current_ambiguity")]
+    current_ambiguity: f64,
+    #[serde(default = "default_deep_interview_threshold")]
+    threshold: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeepInterviewAppendRoundInput {
+    interview_id: String,
+    question: String,
+    answer: String,
+    ambiguity_after: f64,
+    #[serde(default)]
+    ambiguity_before: Option<f64>,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeepInterviewGetInput {
+    #[serde(default)]
+    interview_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct TaskCreateInput {
     prompt: String,
     #[serde(default)]
@@ -2542,6 +2698,14 @@ struct WorkerSendPromptInput {
 
 const fn default_auto_recover_prompt_misdelivery() -> bool {
     true
+}
+
+const fn default_deep_interview_current_ambiguity() -> f64 {
+    1.0
+}
+
+const fn default_deep_interview_threshold() -> f64 {
+    0.25
 }
 
 #[derive(Debug, Deserialize)]
@@ -5956,6 +6120,10 @@ fn plan_mode_state_store() -> ModeStateStore {
     ModeStateStore::new()
 }
 
+fn deep_interview_mode_state_store() -> ModeStateStore {
+    ModeStateStore::new()
+}
+
 fn legacy_plan_mode_state_file() -> Result<PathBuf, String> {
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
     Ok(cwd
@@ -6356,6 +6524,9 @@ mod tests {
         assert!(names.contains(&"StructuredOutput"));
         assert!(names.contains(&"REPL"));
         assert!(names.contains(&"PowerShell"));
+        assert!(names.contains(&"DeepInterviewInit"));
+        assert!(names.contains(&"DeepInterviewAppendRound"));
+        assert!(names.contains(&"DeepInterviewGet"));
         assert!(names.contains(&"WorkerCreate"));
         assert!(names.contains(&"WorkerObserve"));
         assert!(names.contains(&"WorkerAwaitReady"));
@@ -9735,6 +9906,76 @@ printf 'pwsh:%s' "$1"
         if let Some(value) = original_xai {
             std::env::set_var("XAI_API_KEY", value);
         }
+    }
+
+    #[test]
+    fn deep_interview_tools_emit_expected_output_shapes() {
+        let _guard = env_guard();
+        let workspace = temp_path("deep-interview-tools");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("set workspace");
+
+        let initialized = execute_tool(
+            "DeepInterviewInit",
+            &json!({
+                "interview_id": "tools-session",
+                "initial_idea": "Narrow runtime MVP",
+                "current_ambiguity": 0.9,
+                "threshold": 0.3
+            }),
+        )
+        .expect("init tool should succeed");
+        let initialized_json: serde_json::Value =
+            serde_json::from_str(&initialized).expect("json");
+        assert_eq!(initialized_json["status"], "initialized");
+        assert_eq!(initialized_json["mode"], "deep-interview");
+        assert_eq!(initialized_json["ask_user_question_tool"], "AskUserQuestion");
+        assert_eq!(initialized_json["state"]["interview_id"], "tools-session");
+        assert_eq!(
+            initialized_json["spec"]["output_path"],
+            ".omx/specs/deep-interview-narrow-runtime-mvp-tools-session.md"
+        );
+        assert!(initialized_json["spec"]["file_path"]
+            .as_str()
+            .expect("file path")
+            .ends_with(".omx/specs/deep-interview-narrow-runtime-mvp-tools-session.md"));
+
+        let updated = execute_tool(
+            "DeepInterviewAppendRound",
+            &json!({
+                "interview_id": "tools-session",
+                "question": "What remains in scope?",
+                "answer": "Only persisted state, round append, and handoff artifact output.",
+                "ambiguity_after": 0.2,
+                "note": "Ready for handoff"
+            }),
+        )
+        .expect("append tool should succeed");
+        let updated_json: serde_json::Value = serde_json::from_str(&updated).expect("json");
+        assert_eq!(updated_json["status"], "updated");
+        assert_eq!(updated_json["state"]["current_ambiguity"], 0.2);
+        assert_eq!(updated_json["state"]["rounds"][0]["ambiguity"]["before"], 0.9);
+        assert_eq!(
+            updated_json["state"]["rounds"][0]["ambiguity"]["note"],
+            "Ready for handoff"
+        );
+
+        let fetched = execute_tool(
+            "DeepInterviewGet",
+            &json!({ "interview_id": "tools-session" }),
+        )
+        .expect("get tool should succeed");
+        let fetched_json: serde_json::Value = serde_json::from_str(&fetched).expect("json");
+        assert_eq!(fetched_json["status"], "ok");
+        assert_eq!(fetched_json["state"]["rounds"][0]["question"], "What remains in scope?");
+        assert_eq!(
+            fetched_json["state"]["handoff_path"],
+            ".omx/specs/deep-interview-narrow-runtime-mvp-tools-session.md"
+        );
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(&workspace);
     }
 
     #[test]

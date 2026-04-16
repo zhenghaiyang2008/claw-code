@@ -138,11 +138,15 @@ impl ModeStateStore {
     pub fn write(&self, record: &ModeStateRecord) -> Result<PathBuf, ModeStateError> {
         let rendered = serde_json::to_string_pretty(record)?;
         let global_path = self.global_mode_path(&record.mode);
+        let previous_global_contents = fs::read_to_string(&global_path).ok();
         write_atomic(&global_path, &rendered)?;
 
         if let Some(session_id) = record.session_id.as_deref() {
             let session_path = self.session_mode_path(&record.mode, session_id);
-            write_atomic(&session_path, &rendered)?;
+            if let Err(error) = write_atomic(&session_path, &rendered) {
+                restore_file(&global_path, previous_global_contents.as_deref())?;
+                return Err(error.into());
+            }
             return Ok(session_path);
         }
 
@@ -418,6 +422,22 @@ fn replace_file(temp_path: &Path, path: &Path) -> std::io::Result<()> {
     fs::rename(temp_path, path)
 }
 
+fn restore_file(path: &Path, previous_contents: Option<&str>) -> std::io::Result<()> {
+    match previous_contents {
+        Some(contents) => {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(path, contents)
+        }
+        None => match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ModeStateRecord, ModeStateStore};
@@ -623,6 +643,38 @@ mod tests {
             .expect("state should exist");
         assert_eq!(restored.updated_at, "2023-01-15T12:34:56Z");
         assert_eq!(restored.started_at.as_deref(), Some("2023-01-15T12:33:56Z"));
+    }
+
+    #[test]
+    fn session_write_failure_rolls_back_global_alias() {
+        let workspace = TestWorkspace::new();
+        let store = workspace.store();
+
+        let mut original = ModeStateRecord::new("deep-interview", true);
+        original.current_phase = Some("question".to_string());
+        original.updated_at = "2026-04-16T10:00:00Z".to_string();
+        store.write(&original).expect("initial global state should write");
+
+        let sessions_path = workspace.root.join(".omx").join("state").join("sessions");
+        fs::write(&sessions_path, "blocked").expect("sessions path should become a file");
+
+        let mut updated = ModeStateRecord::new("deep-interview", true);
+        updated.session_id = Some("session-fail".to_string());
+        updated.current_phase = Some("handoff".to_string());
+        updated.updated_at = "2026-04-16T10:05:00Z".to_string();
+        let error = store.write(&updated).expect_err("session-scoped write should fail");
+        let rendered = error.to_string();
+        assert!(rendered.contains("directory") || rendered.contains("Not a directory"));
+
+        let restored = store
+            .read("deep-interview", None)
+            .expect("global alias should read")
+            .expect("global alias should still exist");
+        assert_eq!(restored.current_phase.as_deref(), Some("question"));
+        assert!(store
+            .read("deep-interview", Some("session-fail"))
+            .expect("session read should succeed")
+            .is_none());
     }
 
     fn looks_like_rfc3339(value: &str) -> bool {
