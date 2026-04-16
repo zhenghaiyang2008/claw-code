@@ -46,6 +46,7 @@ pub mod summary_compression;
 pub mod task_packet;
 pub mod task_registry;
 pub mod team_cron_registry;
+pub mod verification_runtime;
 #[cfg(test)]
 mod trust_resolver;
 mod usage;
@@ -170,6 +171,14 @@ pub use stale_branch::{
 };
 pub use task_packet::{validate_packet, TaskPacket, TaskPacketValidationError, ValidatedPacket};
 pub use task_registry::{Task, TaskMessage, TaskRegistry, TaskRuntimeMetadata, TaskStatus};
+pub use verification_runtime::{
+    append_or_update_verification_check, initialize_verification_record,
+    mark_verification_reviewer_outcome, read_verification_record, VerificationCheck,
+    VerificationCheckStatus, VerificationCheckUpdateRequest, VerificationInitRequest,
+    VerificationRecord, VerificationReviewer, VerificationReviewerOutcome,
+    VerificationReviewerOutcomeRequest, VerificationRuntimeError, VerificationRuntimeStore,
+    VerificationStatus,
+};
 #[cfg(test)]
 pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver};
 pub use usage::{
