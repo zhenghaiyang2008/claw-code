@@ -1,73 +1,73 @@
-# OMC Runtime Compatibility Design
+# OMC 运行时兼容性设计
 
-## Metadata
-- Date: 2026-04-16
-- Status: Approved for planning
-- Scope: `claw-code` Phase 1/Phase 2 support for OMC-inspired `deep-interview`, `ultrawork`, `ralph`, and `team`
-- Strategy: Phase 1 behavior compatibility first, Phase 2 OMC contract compatibility
+## 元数据
+- 日期：2026-04-16
+- 状态：已批准，可进入规划阶段
+- 范围：为 `claw-code` 设计分阶段支持 OMC 风格的 `deep-interview`、`ultrawork`、`ralph` 与 `team`
+- 策略：Phase 1 先做行为兼容，Phase 2 再做 OMC 契约兼容
 
-## Problem Statement
-`claw-code` already has useful primitives—session persistence, task/team registries, worker boot state, skill lookup, and `AskUserQuestion`—but it does not yet have a unified orchestration substrate. The missing pieces are persistent mode state, persistent task/team runtime data, structured verification records, and a clean handoff path between clarification, execution, and coordination modes.
+## 问题陈述
+`claw-code` 已经具备一些有价值的基础能力——会话持久化、任务/团队注册表、worker 启动状态机、skill 查找与 `AskUserQuestion`——但还缺少统一的编排底座。当前缺口主要在于：模式状态持久化、任务/团队运行时数据持久化、结构化验证记录，以及澄清模式、执行模式、协调模式之间的稳定交接路径。
 
-The goal is to add a claw-native orchestration runtime that can behave like core OMC workflows without immediately taking on full Claude Code plugin compatibility.
+目标是在不立即承担完整 Claude Code 插件兼容成本的前提下，增加一个 claw-native 的编排运行时，使其能够表现出 OMC 核心工作流的主要行为。
 
-## Goals
-1. Support behavior-compatible MVPs for `deep-interview`, `ultrawork`, `ralph`, and `team`.
-2. Persist mode, task, team, and verification runtime state across interruptions.
-3. Keep Phase 1 claw-native and upgradeable, so Phase 2 can add OMC-facing adapters without rewriting the core runtime.
-4. Reuse existing `SessionStore`, `Session`, skill lookup, and worker boot machinery wherever possible.
+## 目标
+1. 提供 `deep-interview`、`ultrawork`、`ralph` 与 `team` 的行为兼容 MVP。
+2. 让模式、任务、团队与验证运行时状态能够跨中断持久化。
+3. 让 Phase 1 保持 claw-native 且可升级，使 Phase 2 能在不重写核心运行时的情况下增加 OMC 适配层。
+4. 尽可能复用现有的 `SessionStore`、`Session`、skill 查找逻辑与 worker boot 机制。
 
-## Non-Goals
-- Full `/oh-my-claudecode:*` slash-command compatibility in Phase 1.
-- Full Claude Code plugin manifest compatibility in Phase 1.
-- Full OMC lifecycle hook coverage (`UserPromptSubmit`, `SessionStart`, `Stop`, `PreCompact`, etc.) in Phase 1.
-- `omc-teams` tmux runtime or external `claude`/`codex`/`gemini` worker compatibility in Phase 1.
-- Full OMC memory ecosystem (`notepad`, `project_memory`, `shared_memory`) in Phase 1.
+## 非目标
+- Phase 1 不做完整 `/oh-my-claudecode:*` slash command 兼容。
+- Phase 1 不做完整 Claude Code 插件 manifest 兼容。
+- Phase 1 不做完整 OMC 生命周期 hooks 覆盖（如 `UserPromptSubmit`、`SessionStart`、`Stop`、`PreCompact` 等）。
+- Phase 1 不做 `omc-teams` 的 tmux 运行时，也不兼容外部 `claude` / `codex` / `gemini` worker。
+- Phase 1 不做完整 OMC memory 生态（`notepad`、`project_memory`、`shared_memory`）。
 
-## Existing Evidence
-- `TaskRegistry` and `TeamRegistry` are currently in-memory only.
-- `SessionStore` and `Session` already support workspace-scoped persistent session storage under `.claw/sessions/<workspace-hash>/` with per-session JSONL files.
-- `worker_boot.rs` already implements a worker control-plane state machine.
-- Skill resolution already scans `.omc`, `.agents`, `.claw`, `.codex`, and `.claude` roots.
-- `claw` explicitly does not yet load OMC plugin slash commands, Claude statusline stdin, or OMC session hooks.
-- Plugin manifest compatibility currently rejects Claude Code plugin contract fields such as `skills`, `agents`, `commands`, and `mcpServers`.
+## 现有证据
+- `TaskRegistry` 与 `TeamRegistry` 当前都是纯内存实现。
+- `SessionStore` 与 `Session` 已支持基于工作区的持久化，会话文件位于 `.claw/sessions/<workspace-hash>/` 下。
+- `worker_boot.rs` 已实现 worker 控制平面的状态机。
+- skill 解析已经会扫描 `.omc`、`.agents`、`.claw`、`.codex` 与 `.claude` 根路径。
+- `claw` 明确声明当前尚不加载 OMC 插件 slash commands、Claude statusline stdin 或 OMC session hooks。
+- 插件 manifest 兼容层目前会拒绝 Claude Code 插件契约中的 `skills`、`agents`、`commands` 与 `mcpServers` 等字段。
 
-## Architecture
-Phase 1 introduces a claw-native orchestration runtime with six modules:
+## 架构
+Phase 1 引入一个 claw-native 的编排运行时，由六个模块构成：
 
 1. **Mode State Store**
-   - Unified runtime state for `deep-interview`, `ultrawork`, `ralph`, and `team`.
-   - Tracks `active`, `current_phase`, `iteration`, `session_id`, timestamps, and runtime context.
+   - 为 `deep-interview`、`ultrawork`、`ralph` 与 `team` 提供统一运行态。
+   - 记录 `active`、`current_phase`、`iteration`、`session_id`、时间戳与运行时上下文。
 
 2. **Persistent Task Store**
-   - Replaces in-memory-only task lifecycle storage with durable task records.
-   - Supports status, prompts, messages, output, dependencies, artifacts, and session/team linkage.
+   - 将仅存在于内存中的任务生命周期数据改为可持久化任务记录。
+   - 支持状态、提示词、消息、输出、依赖、产物，以及 session/team 关联。
 
 3. **Team Runtime**
-   - Claude-native task grouping and phase orchestration.
-   - Starts as a minimal coordination layer without tmux or external CLI workers.
+   - 提供 claw-native 的任务分组与阶段化协同。
+   - 初期只做最小协调层，不接入 tmux 或外部 CLI workers。
 
 4. **Verification Runtime**
-   - Stores acceptance criteria, verifier outcomes, and command/test/build evidence.
-   - Acts as the substrate for `ralph` completion logic.
+   - 保存验收标准、verifier 结果，以及命令/测试/构建证据。
+   - 作为 `ralph` 完成判定的基础设施。
 
 5. **Session / Worker Bridge**
-   - Reuses existing session persistence and worker boot control-plane code.
-   - Connects orchestration state to resumable sessions rather than replacing session storage.
+   - 复用现有会话持久化与 worker boot 控制平面代码。
+   - 将编排状态连接到可恢复会话，而不是替换现有会话存储。
 
 6. **Spec Artifact Layer**
-   - Supports `deep-interview` output under `.omx/specs/`.
-   - Provides a stable handoff artifact for later planning and execution modes.
+   - 支持 `deep-interview` 在 `.omx/specs/` 下输出 spec。
+   - 为后续 planning 与 execution 模式提供稳定的交接产物。
 
-### Dependency Shape
+### 依赖关系
 `Session / Worker Bridge -> Mode State Store -> {Task Runtime, Team Runtime, Verification Runtime}`
 
-`deep-interview` feeds specs into later modes. `ultrawork` is the parallel execution layer. `ralph` depends on `ultrawork` plus verification and persistence. `team` depends on persistent task/team coordination.
+`deep-interview` 负责生成 spec 并交给后续模式。`ultrawork` 是并行执行层。`ralph` 依赖 `ultrawork`，同时依赖验证与持久化。`team` 依赖持久化的任务/团队协调能力。
 
-## Data Model and File Layout
-Use existing worktree conventions rather than inventing a new root.
+## 数据模型与文件布局
+优先复用现有工作区约定，而不是新造一个根目录。
 
-### File Layout
+### 文件布局
 ```text
 .omx/
   state/
@@ -167,31 +167,31 @@ Use existing worktree conventions rather than inventing a new root.
 }
 ```
 
-## Phase 1 MVP Scope
+## Phase 1 MVP 范围
 ### deep-interview MVP
-- One-question-at-a-time interview loop.
-- Persistent interview state and ambiguity scoring.
-- Spec output to `.omx/specs/deep-interview-<slug>.md`.
-- Handoff into claw-native planning/execution lanes.
+- 单轮单问题的访谈循环。
+- 可持久化的访谈状态与 ambiguity score。
+- 输出 spec 到 `.omx/specs/deep-interview-<slug>.md`。
+- 能交接到 claw-native 的 planning / execution 流程。
 
 ### ultrawork MVP
-- Parallel task dispatch.
-- Simple dependency grouping.
-- Lightweight build/test verification.
+- 并行任务分发。
+- 简单依赖分组。
+- 轻量 build/test 验证。
 
 ### ralph MVP
-- Iteration loop.
-- Acceptance tracking.
-- Verifier gate.
-- Resume/retry support.
+- iteration loop。
+- acceptance tracking。
+- verifier gate。
+- resume / retry 能力。
 
 ### team MVP
-- Create team.
-- Assign tasks.
-- Track phase transitions.
-- Aggregate status.
+- 创建 team。
+- 分配 tasks。
+- 跟踪 phase transitions。
+- 聚合状态展示。
 
-## Implementation Order
+## 实现顺序
 1. Mode State Store
 2. Persistent Task Store
 3. deep-interview MVP
@@ -200,25 +200,25 @@ Use existing worktree conventions rather than inventing a new root.
 6. ralph MVP
 7. team MVP
 
-This order gives the earliest usable clarification flow after the shared state layer lands, then layers execution, verification, persistence, and coordination without forcing later rewrites.
+这个顺序可以在共享状态层落地后，尽快得到第一个可用的澄清模式，然后逐步叠加执行、验证、持久化与协调能力，同时避免后续推倒重来。
 
-## Risks and Mitigations
-### Risk 1: Embedding mode logic directly into current registries
-Mitigation: keep registries/data-access thin; implement orchestration behavior in a new runtime layer.
+## 风险与缓解
+### 风险 1：把模式逻辑直接塞进当前 registries
+缓解：保持 registry / data access 层足够薄，把编排行为放进新的 runtime 层。
 
-### Risk 2: Chasing OMC surface compatibility too early
-Mitigation: Phase 1 targets behavior compatibility only.
+### 风险 2：过早追求 OMC 表面兼容
+缓解：Phase 1 仅追求行为兼容。
 
-### Risk 3: Shipping `ralph` before structured verification exists
-Mitigation: require verification runtime before `ralph` MVP completion.
+### 风险 3：在结构化验证能力未落地前就上线 `ralph`
+缓解：要求在 `ralph` MVP 完成前先落地 verification runtime。
 
-### Risk 4: Implementing tmux/external worker team runtime too early
-Mitigation: keep Phase 1 `team` Claude-native only.
+### 风险 4：过早做 tmux / 外部 worker team runtime
+缓解：Phase 1 的 `team` 仅限 claw-native 协调模式。
 
-## Milestones
+## 里程碑
 ### Milestone 1
-- Mode state persistence
-- Persistent task store
+- mode state 持久化
+- persistent task store
 
 ### Milestone 2
 - deep-interview MVP
@@ -231,38 +231,38 @@ Mitigation: keep Phase 1 `team` Claude-native only.
 ### Milestone 4
 - team MVP
 
-## Phase 2 Upgrade Path
-Phase 2 adds OMC-facing adapters without replacing the Phase 1 core.
+## Phase 2 升级路径
+Phase 2 在不替换 Phase 1 核心的前提下，增加面向 OMC 的适配层。
 
-### Phase 2A: Contract Alignment
-- Align state/handoff field semantics with OMC expectations.
-- Keep claw-native core, add stable adapter boundaries.
+### Phase 2A：契约对齐
+- 让 state / handoff 字段语义尽量与 OMC 对齐。
+- 保持 claw-native 核心，实现稳定 adapter 边界。
 
-### Phase 2B: Lifecycle Hooks
-- Add `UserPromptSubmit`, `SessionStart`, and `Stop` coverage first.
-- Defer `SubagentStart/Stop`, `PreCompact`, and full lifecycle parity until later.
+### Phase 2B：生命周期 Hooks
+- 优先补 `UserPromptSubmit`、`SessionStart` 与 `Stop`。
+- `SubagentStart/Stop`、`PreCompact` 与更完整的生命周期对齐后续再做。
 
-### Phase 2C: Plugin and Slash Compatibility
-- Add adapter support for `/oh-my-claudecode:*` style slash commands.
-- Bridge plugin-managed `skills`, `agents`, `commands`, and `mcpServers` where feasible.
+### Phase 2C：插件与 Slash Compatibility
+- 增加 `/oh-my-claudecode:*` 风格 slash command 的适配支持。
+- 在可行范围内桥接插件管理的 `skills`、`agents`、`commands` 与 `mcpServers`。
 
-### Phase 2D: External Team Runtime
-- Add `omc-teams` / tmux / external CLI worker compatibility.
-- Build this last, after team runtime, state semantics, and lifecycle hooks stabilize.
+### Phase 2D：外部 Team Runtime
+- 增加 `omc-teams` / tmux / 外部 CLI worker 兼容。
+- 这一步最后做，前提是 team runtime、state 语义与 lifecycle hooks 都已稳定。
 
-## Design Principle
-The core runtime should remain claw-native:
+## 设计原则
+核心运行时应保持 claw-native：
 
 ```text
 core runtime = claw-native orchestration substrate
 compat layer = OMC-facing adapters and lifecycle bridges
 ```
 
-That separation preserves maintainability and minimizes rewrite risk while still creating a realistic path to stronger OMC compatibility.
+这种分层能在保持可维护性的同时，降低重写风险，并为后续更强的 OMC 兼容性留出清晰升级路径。
 
-## Acceptance Criteria
-- A planning artifact exists that defines a claw-native runtime for `deep-interview`, `ultrawork`, `ralph`, and `team`.
-- The design defines explicit Phase 1 non-goals to prevent scope drift.
-- The design defines persistent file layouts and schemas for mode, task, team, and verification data.
-- The design defines an implementation order that makes `deep-interview` and `ultrawork` possible before `ralph` and `team` complete.
-- The design defines a Phase 2 path that adds OMC compatibility without replacing the Phase 1 core.
+## 验收标准
+- 存在一份规划产物，定义了 `deep-interview`、`ultrawork`、`ralph` 与 `team` 的 claw-native 运行时设计。
+- 设计明确列出 Phase 1 非目标，防止范围失控。
+- 设计定义了 mode、task、team 与 verification 数据的持久化布局与 schema。
+- 设计定义了一个实现顺序，使 `deep-interview` 与 `ultrawork` 能在 `ralph` 与 `team` 之前落地。
+- 设计定义了 Phase 2 路径，能够在不替换 Phase 1 核心的前提下增加 OMC 兼容性。
