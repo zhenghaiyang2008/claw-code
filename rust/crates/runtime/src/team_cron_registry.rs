@@ -15,6 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::omc_compat::{build_omc_handoff, OmcCompatHandoff};
+
 static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 const FILE_LOCK_RETRY_ATTEMPTS: u32 = 100;
 const FILE_LOCK_RETRY_DELAY_MS: u64 = 10;
@@ -72,6 +74,8 @@ pub struct Team {
     pub phase: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<OmcCompatHandoff>,
     pub task_ids: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -180,6 +184,7 @@ impl TeamRegistry {
             phase: normalize_optional_text(metadata.phase)
                 .unwrap_or_else(|| String::from("created")),
             session_id: normalize_optional_text(metadata.session_id),
+            handoff: Some(build_team_handoff(&team_id)),
             task_ids,
             created_at: timestamp.clone(),
             updated_at: timestamp,
@@ -273,6 +278,9 @@ impl TeamRegistry {
             .load_team(team_id)?
             .ok_or_else(|| format!("team not found: {team_id}"))?;
         update(&mut team)?;
+        if team.handoff.is_none() {
+            team.handoff = Some(build_team_handoff(&team.team_id));
+        }
         team.updated_at = now_rfc3339();
         self.save_team(&team)?;
         Ok(team)
@@ -338,7 +346,10 @@ impl TeamRegistry {
             return Ok(None);
         }
         let contents = fs::read_to_string(path).map_err(|error| error.to_string())?;
-        let team: Team = serde_json::from_str(&contents).map_err(|error| error.to_string())?;
+        let mut team: Team = serde_json::from_str(&contents).map_err(|error| error.to_string())?;
+        if team.handoff.is_none() {
+            team.handoff = Some(build_team_handoff(&team.team_id));
+        }
         validate_team(&team)?;
         Ok(Some(team))
     }
@@ -448,7 +459,11 @@ impl TeamRegistry {
                 continue;
             }
             let contents = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-            let team: Team = serde_json::from_str(&contents).map_err(|error| error.to_string())?;
+            let mut team: Team =
+                serde_json::from_str(&contents).map_err(|error| error.to_string())?;
+            if team.handoff.is_none() {
+                team.handoff = Some(build_team_handoff(&team.team_id));
+            }
             teams.push(team);
         }
         Ok(teams)
@@ -480,6 +495,10 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
             Some(trimmed.to_string())
         }
     })
+}
+
+fn build_team_handoff(team_id: &str) -> OmcCompatHandoff {
+    build_omc_handoff(None, &[], &format!(".omx/runtime/teams/{team_id}.json"))
 }
 
 fn validate_team(team: &Team) -> Result<(), String> {
@@ -813,8 +832,53 @@ mod tests {
             .registry()
             .get(&created.team_id)
             .expect("team should exist");
+        let expected_handoff_path = format!(".omx/runtime/teams/{}.json", created.team_id);
         assert_eq!(restored.phase, "dispatch");
         assert_eq!(restored.session_id.as_deref(), Some("session-42"));
+        assert_eq!(
+            restored.handoff.as_ref().map(|handoff| handoff.handoff_path.as_str()),
+            Some(expected_handoff_path.as_str())
+        );
+    }
+
+    #[test]
+    fn load_backfills_handoff_for_legacy_team_record() {
+        let workspace = TestWorkspace::new();
+        let registry = workspace.registry();
+        let team_id = "team_00000001_1";
+        let team_path = registry.team_path(team_id).expect("team path should resolve");
+        fs::create_dir_all(team_path.parent().expect("team path should have parent"))
+            .expect("team directory should exist");
+        fs::write(
+            &team_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "team_id": team_id,
+                "name": "Legacy team",
+                "status": "created",
+                "phase": "dispatch",
+                "session_id": "legacy-session",
+                "task_ids": ["task-1"],
+                "created_at": "2026-04-17T00:00:00Z",
+                "updated_at": "2026-04-17T00:00:00Z"
+            }))
+            .expect("legacy team should serialize"),
+        )
+        .expect("legacy team should write");
+
+        let raw_before = fs::read_to_string(&team_path).expect("legacy team should exist");
+        assert!(!raw_before.contains("\"handoff\""));
+
+        let restored = registry
+            .try_get(team_id)
+            .expect("team should load")
+            .expect("team should exist");
+        assert_eq!(
+            restored.handoff.as_ref().map(|handoff| handoff.handoff_path.as_str()),
+            Some(".omx/runtime/teams/team_00000001_1.json")
+        );
+
+        let raw_after = fs::read_to_string(&team_path).expect("legacy team should still exist");
+        assert!(!raw_after.contains("\"handoff\""));
     }
 
     #[test]

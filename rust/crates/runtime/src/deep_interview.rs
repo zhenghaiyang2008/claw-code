@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::file_ops::{write_file, WriteFileOutput};
 use crate::mode_state::{ModeStateError, ModeStateRecord, ModeStateStore};
+use crate::omc_compat::{build_omc_handoff, OmcCompatHandoff};
 
 pub const DEEP_INTERVIEW_MODE: &str = "deep-interview";
 const DEFAULT_INTERVIEW_ID_PREFIX: &str = "deep-interview";
@@ -60,6 +61,8 @@ pub struct DeepInterviewState {
     pub threshold: f64,
     pub output_spec_path: String,
     pub handoff_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<OmcCompatHandoff>,
 }
 
 impl DeepInterviewState {
@@ -129,7 +132,7 @@ pub fn initialize_deep_interview_session(
         ),
     };
     let output_spec_path = build_output_spec_path(&initial_idea, &interview_id);
-    let state = DeepInterviewState {
+    let mut state = DeepInterviewState {
         interview_id,
         initial_idea,
         rounds: Vec::new(),
@@ -137,7 +140,9 @@ pub fn initialize_deep_interview_session(
         threshold: request.threshold,
         handoff_path: output_spec_path.clone(),
         output_spec_path,
+        handoff: None,
     };
+    state.handoff = Some(build_deep_interview_handoff(&state));
     let spec_output = persist_deep_interview_session(store, &state)?;
     Ok(DeepInterviewSessionArtifact { state, spec_output })
 }
@@ -174,6 +179,7 @@ pub fn append_deep_interview_round(
         recorded_at: iso8601_now(),
     });
     state.current_ambiguity = request.ambiguity_after;
+    state.handoff = Some(build_deep_interview_handoff(&state));
     let spec_output = persist_deep_interview_session(store, &state)?;
     Ok(DeepInterviewSessionArtifact { state, spec_output })
 }
@@ -188,7 +194,14 @@ pub fn read_deep_interview_state(
     store
         .read(DEEP_INTERVIEW_MODE, normalized_interview_id.as_deref())
         .map_err(DeepInterviewError::from)?
-        .map(|record| serde_json::from_value(record.context).map_err(DeepInterviewError::from))
+        .map(|record| {
+            let mut state: DeepInterviewState =
+                serde_json::from_value(record.context).map_err(DeepInterviewError::from)?;
+            if state.handoff.is_none() {
+                state.handoff = Some(build_deep_interview_handoff(&state));
+            }
+            Ok(state)
+        })
         .transpose()
 }
 
@@ -227,12 +240,22 @@ fn write_deep_interview_state(
     store: &ModeStateStore,
     state: &DeepInterviewState,
 ) -> Result<PathBuf, DeepInterviewError> {
+    let mut persisted_state = state.clone();
+    persisted_state.handoff = Some(build_deep_interview_handoff(&persisted_state));
     let mut record = ModeStateRecord::new(DEEP_INTERVIEW_MODE, true);
-    record.session_id = Some(state.interview_id.clone());
-    record.iteration = Some(state.rounds.len() as u64);
-    record.current_phase = Some(state.phase().to_string());
-    record.context = serde_json::to_value(state)?;
+    record.session_id = Some(persisted_state.interview_id.clone());
+    record.iteration = Some(persisted_state.rounds.len() as u64);
+    record.current_phase = Some(persisted_state.phase().to_string());
+    record.context = serde_json::to_value(&persisted_state)?;
     store.write(&record).map_err(Into::into)
+}
+
+fn build_deep_interview_handoff(state: &DeepInterviewState) -> OmcCompatHandoff {
+    build_omc_handoff(
+        (state.phase() == "handoff").then_some("plan"),
+        &[],
+        &state.handoff_path,
+    )
 }
 
 fn render_deep_interview_spec(state: &DeepInterviewState) -> String {
@@ -407,7 +430,8 @@ mod tests {
         materialize_deep_interview_spec, read_deep_interview_state, write_deep_interview_state,
         DeepInterviewAppendRequest, DeepInterviewInitRequest,
     };
-    use crate::ModeStateStore;
+    use crate::{ModeStateRecord, ModeStateStore};
+    use serde_json::json;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -462,11 +486,64 @@ mod tests {
             restored.output_spec_path,
             ".omx/specs/deep-interview-milestone-2-runtime-persistence-runtime-session.md"
         );
+        assert_eq!(
+            restored.handoff.as_ref().map(|handoff| handoff.handoff_path.as_str()),
+            Some(".omx/specs/deep-interview-milestone-2-runtime-persistence-runtime-session.md")
+        );
+        assert_eq!(
+            restored.handoff.as_ref().and_then(|handoff| handoff.next_skill.as_deref()),
+            None
+        );
 
         let global_alias = read_deep_interview_state(&store, None)
             .expect("global alias should read")
             .expect("state should exist");
         assert_eq!(global_alias.interview_id, "runtime-session");
+    }
+
+    #[test]
+    fn read_backfills_handoff_for_legacy_persisted_state() {
+        let workspace = TestWorkspace::new();
+        let store = workspace.store();
+        let handoff_path = ".omx/specs/deep-interview-legacy-session.md";
+
+        let mut legacy_record = ModeStateRecord::new("deep-interview", true);
+        legacy_record.session_id = Some("legacy-session".to_string());
+        legacy_record.current_phase = Some("handoff".to_string());
+        legacy_record.context = json!({
+            "interview_id": "legacy-session",
+            "initial_idea": "Legacy runtime interview",
+            "rounds": [],
+            "current_ambiguity": 0.1,
+            "threshold": 0.2,
+            "output_spec_path": handoff_path,
+            "handoff_path": handoff_path
+        });
+        store.write(&legacy_record).expect("legacy state should persist");
+
+        let raw_record = store
+            .read("deep-interview", Some("legacy-session"))
+            .expect("raw record should read")
+            .expect("raw record should exist");
+        assert!(raw_record.context.get("handoff").is_none());
+
+        let restored = read_deep_interview_state(&store, Some("legacy-session"))
+            .expect("state should read")
+            .expect("state should exist");
+        assert_eq!(
+            restored.handoff.as_ref().map(|handoff| handoff.handoff_path.as_str()),
+            Some(handoff_path)
+        );
+        assert_eq!(
+            restored.handoff.as_ref().and_then(|handoff| handoff.next_skill.as_deref()),
+            Some("plan")
+        );
+
+        let persisted_after_read = store
+            .read("deep-interview", Some("legacy-session"))
+            .expect("persisted record should read")
+            .expect("persisted record should exist");
+        assert!(persisted_after_read.context.get("handoff").is_none());
     }
 
     #[test]
@@ -513,6 +590,14 @@ mod tests {
             .expect("record should exist");
         assert_eq!(raw_record.current_phase.as_deref(), Some("handoff"));
         assert_eq!(raw_record.iteration, Some(1));
+        assert_eq!(
+            persisted
+                .state
+                .handoff
+                .as_ref()
+                .and_then(|handoff| handoff.next_skill.as_deref()),
+            Some("plan")
+        );
     }
 
     #[test]
@@ -678,6 +763,7 @@ mod tests {
             .expect("state should exist");
         state.output_spec_path = ".omx/specs-blocked/rollback.md".to_string();
         state.handoff_path = state.output_spec_path.clone();
+        state.handoff = Some(super::build_deep_interview_handoff(&state));
         write_deep_interview_state(&store, &state).expect("state should rewrite");
 
         let blocked_parent = workspace.root.join(".omx").join("specs-blocked");

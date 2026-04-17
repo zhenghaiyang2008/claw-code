@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use serde::de::Deserializer;
 use serde_json::Value;
 
+use crate::omc_compat::normalize_mode_name;
+
 static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
@@ -73,9 +75,10 @@ pub struct ModeStateRecord {
 impl ModeStateRecord {
     #[must_use]
     pub fn new(mode: impl Into<String>, active: bool) -> Self {
+        let mode = mode.into();
         let now = iso8601_now();
         Self {
-            mode: mode.into(),
+            mode: normalize_mode_name(&mode).to_string(),
             active,
             current_phase: None,
             session_id: None,
@@ -129,6 +132,7 @@ impl ModeStateStore {
 
     #[must_use]
     pub fn mode_path(&self, mode: &str, session_id: Option<&str>) -> PathBuf {
+        let mode = normalize_mode_name(mode);
         match session_id {
             Some(session_id) => self.session_mode_path(mode, session_id),
             None => self.global_mode_path(mode),
@@ -136,13 +140,15 @@ impl ModeStateStore {
     }
 
     pub fn write(&self, record: &ModeStateRecord) -> Result<PathBuf, ModeStateError> {
-        let rendered = serde_json::to_string_pretty(record)?;
-        let global_path = self.global_mode_path(&record.mode);
+        let mut normalized_record = record.clone();
+        normalized_record.mode = normalize_mode_name(&normalized_record.mode).to_string();
+        let rendered = serde_json::to_string_pretty(&normalized_record)?;
+        let global_path = self.global_mode_path(&normalized_record.mode);
         let previous_global_contents = fs::read_to_string(&global_path).ok();
         write_atomic(&global_path, &rendered)?;
 
-        if let Some(session_id) = record.session_id.as_deref() {
-            let session_path = self.session_mode_path(&record.mode, session_id);
+        if let Some(session_id) = normalized_record.session_id.as_deref() {
+            let session_path = self.session_mode_path(&normalized_record.mode, session_id);
             if let Err(error) = write_atomic(&session_path, &rendered) {
                 restore_file(&global_path, previous_global_contents.as_deref())?;
                 return Err(error.into());
@@ -158,28 +164,39 @@ impl ModeStateStore {
         mode: &str,
         session_id: Option<&str>,
     ) -> Result<Option<ModeStateRecord>, ModeStateError> {
-        let path = self.mode_path(mode, session_id);
-        if !path.exists() {
-            return Ok(None);
+        for path in self.mode_path_candidates(mode, session_id) {
+            if let Some(record) = self.read_mode_file(&path)? {
+                return Ok(Some(record));
+            }
         }
-        let contents = fs::read_to_string(path)?;
-        let record = serde_json::from_str(&contents)?;
-        Ok(Some(record))
+        Ok(None)
     }
 
     pub fn clear(&self, mode: &str, session_id: Option<&str>) -> Result<bool, ModeStateError> {
+        let mode = normalize_mode_name(mode);
         match session_id {
             Some(session_id) => {
-                let mut removed = remove_file_if_present(&self.session_mode_path(mode, session_id))?;
-                let global_path = self.global_mode_path(mode);
-                if let Some(global_record) = self.read_mode_file(&global_path)? {
-                    if global_record.session_id.as_deref() == Some(session_id) {
-                        removed |= remove_file_if_present(&global_path)?;
+                let mut removed = false;
+                for path in self.mode_path_candidates(mode, Some(session_id)) {
+                    removed |= remove_file_if_present(&path)?;
+                }
+
+                for global_path in self.mode_path_candidates(mode, None) {
+                    if let Some(global_record) = self.read_mode_file(&global_path)? {
+                        if global_record.session_id.as_deref() == Some(session_id) {
+                            removed |= remove_file_if_present(&global_path)?;
+                        }
                     }
                 }
                 Ok(removed)
             }
-            None => remove_file_if_present(&self.global_mode_path(mode)),
+            None => {
+                let mut removed = false;
+                for path in self.mode_path_candidates(mode, None) {
+                    removed |= remove_file_if_present(&path)?;
+                }
+                Ok(removed)
+            }
         }
     }
 
@@ -236,9 +253,9 @@ impl ModeStateStore {
                 continue;
             }
             let file_name = entry.file_name().to_string_lossy().to_string();
-            let Some(mode) = file_name.strip_suffix("-state.json") else {
+            if file_name.strip_suffix("-state.json").is_none() {
                 continue;
-            };
+            }
             let Some(record) = self.read_mode_file(&path)? else {
                 continue;
             };
@@ -247,7 +264,7 @@ impl ModeStateStore {
             }
             let effective_session_id = session_id.clone().or_else(|| record.session_id.clone());
             let summary = ModeStateSummary {
-                mode: mode.to_string(),
+                mode: record.mode.clone(),
                 session_id: effective_session_id.clone(),
                 active: record.active,
                 current_phase: record.current_phase.clone(),
@@ -280,18 +297,51 @@ impl ModeStateStore {
             .join(format!("{mode}-state.json"))
     }
 
+    fn mode_path_candidates(&self, mode: &str, session_id: Option<&str>) -> Vec<PathBuf> {
+        let mode = normalize_mode_name(mode);
+        let mut candidates = Vec::with_capacity(1 + legacy_mode_file_aliases(mode).len());
+        let canonical_path = match session_id {
+            Some(session_id) => self.session_mode_path(mode, session_id),
+            None => self.global_mode_path(mode),
+        };
+        candidates.push(canonical_path);
+
+        for alias in legacy_mode_file_aliases(mode) {
+            let path = match session_id {
+                Some(session_id) => self.session_mode_path(alias, session_id),
+                None => self.global_mode_path(alias),
+            };
+            if !candidates.contains(&path) {
+                candidates.push(path);
+            }
+        }
+
+        candidates
+    }
+
     fn read_mode_file(&self, path: &Path) -> Result<Option<ModeStateRecord>, ModeStateError> {
         if !path.exists() {
             return Ok(None);
         }
         let contents = fs::read_to_string(path)?;
-        let record = serde_json::from_str(&contents)?;
+        let mut record: ModeStateRecord = serde_json::from_str(&contents)?;
+        record.mode = normalize_mode_name(&record.mode).to_string();
         Ok(Some(record))
     }
 }
 
 fn default_context() -> Value {
     Value::Object(serde_json::Map::new())
+}
+
+fn legacy_mode_file_aliases(mode: &str) -> &'static [&'static str] {
+    match mode {
+        "deep-interview" => &["deep_interview", "deep interview", "deepinterview"],
+        "ultrawork" => &["ultra-work", "ultra_work", "ultra work"],
+        "verification" => &["verify", "verifier", "verificationagent", "verification-agent", "verification_agent"],
+        "team" => &["swarm"],
+        _ => &[],
+    }
 }
 
 fn iso8601_now() -> String {
@@ -674,6 +724,213 @@ mod tests {
         assert!(store
             .read("deep-interview", Some("session-fail"))
             .expect("session read should succeed")
+            .is_none());
+    }
+
+    #[test]
+    fn mode_state_normalizes_omc_mode_aliases_for_storage() {
+        let workspace = TestWorkspace::new();
+        let store = workspace.store();
+        let record = ModeStateRecord::new(" Deep_Interview ", true);
+
+        let path = store.write(&record).expect("state should write");
+        assert!(path.ends_with(PathBuf::from(".omx/state/deep-interview-state.json")));
+
+        let restored = store
+            .read("deep interview", None)
+            .expect("alias read should succeed")
+            .expect("state should exist");
+        assert_eq!(restored.mode, "deep-interview");
+    }
+
+    #[test]
+    fn read_normalizes_legacy_aliased_mode_values_from_persisted_state() {
+        let workspace = TestWorkspace::new();
+        let store = workspace.store();
+        let path = store.mode_path("deep-interview", None);
+        fs::create_dir_all(path.parent().expect("state parent")).expect("state parent should exist");
+        fs::write(
+            &path,
+            r#"{
+  "mode": "deep_interview",
+  "active": true,
+  "updated_at": "2026-04-17T00:00:00Z",
+  "started_at": "2026-04-17T00:00:00Z",
+  "completed_at": null,
+  "context": {}
+}"#,
+        )
+        .expect("legacy aliased state should write");
+
+        let restored = store
+            .read("deep-interview", None)
+            .expect("read should succeed")
+            .expect("state should exist");
+        assert_eq!(restored.mode, "deep-interview");
+    }
+
+    #[test]
+    fn reads_global_legacy_alias_named_mode_state_file() {
+        let workspace = TestWorkspace::new();
+        let store = workspace.store();
+        let path = workspace
+            .root
+            .join(".omx")
+            .join("state")
+            .join("deep_interview-state.json");
+        fs::create_dir_all(path.parent().expect("state parent")).expect("state parent should exist");
+        fs::write(
+            &path,
+            r#"{
+  "mode": "deep_interview",
+  "active": true,
+  "updated_at": "2026-04-17T00:00:00Z",
+  "started_at": "2026-04-17T00:00:00Z",
+  "completed_at": null,
+  "context": {}
+}"#,
+        )
+        .expect("legacy alias-named state should write");
+
+        let restored = store
+            .read("deep-interview", None)
+            .expect("read should succeed")
+            .expect("state should exist");
+        assert_eq!(restored.mode, "deep-interview");
+        assert!(store.mode_path("deep-interview", None).ends_with("deep-interview-state.json"));
+    }
+
+    #[test]
+    fn reads_session_scoped_legacy_alias_named_mode_state_file() {
+        let workspace = TestWorkspace::new();
+        let store = workspace.store();
+        let path = workspace
+            .root
+            .join(".omx")
+            .join("state")
+            .join("sessions")
+            .join("session-legacy")
+            .join("deep_interview-state.json");
+        fs::create_dir_all(path.parent().expect("state parent")).expect("state parent should exist");
+        fs::write(
+            &path,
+            r#"{
+  "mode": "deep_interview",
+  "active": true,
+  "session_id": "session-legacy",
+  "updated_at": "2026-04-17T00:00:00Z",
+  "started_at": "2026-04-17T00:00:00Z",
+  "completed_at": null,
+  "context": {}
+}"#,
+        )
+        .expect("legacy alias-named session state should write");
+
+        let restored = store
+            .read("deep-interview", Some("session-legacy"))
+            .expect("read should succeed")
+            .expect("state should exist");
+        assert_eq!(restored.mode, "deep-interview");
+        assert_eq!(restored.session_id.as_deref(), Some("session-legacy"));
+    }
+
+    #[test]
+    fn clear_normalizes_global_alias_mode_names() {
+        let workspace = TestWorkspace::new();
+        let store = workspace.store();
+        let record = ModeStateRecord::new("deep-interview", true);
+        store.write(&record).expect("state should write");
+
+        assert!(store
+            .clear("deep interview", None)
+            .expect("alias clear should succeed"));
+        assert!(store
+            .read("deep-interview", None)
+            .expect("read should succeed")
+            .is_none());
+    }
+
+    #[test]
+    fn clear_normalizes_session_alias_mode_names() {
+        let workspace = TestWorkspace::new();
+        let store = workspace.store();
+        let mut record = ModeStateRecord::new("deep-interview", true);
+        record.session_id = Some("session-alias".to_string());
+        store.write(&record).expect("state should write");
+
+        assert!(store
+            .clear("deep_interview", Some("session-alias"))
+            .expect("alias clear should succeed"));
+        assert!(store
+            .read("deep-interview", Some("session-alias"))
+            .expect("session read should succeed")
+            .is_none());
+        assert!(store
+            .read("deep-interview", None)
+            .expect("global read should succeed")
+            .is_none());
+    }
+
+    #[test]
+    fn clear_removes_legacy_alias_named_mode_state_files() {
+        let workspace = TestWorkspace::new();
+        let store = workspace.store();
+        let global_alias_path = workspace
+            .root
+            .join(".omx")
+            .join("state")
+            .join("deep_interview-state.json");
+        fs::create_dir_all(global_alias_path.parent().expect("state parent"))
+            .expect("state parent should exist");
+        fs::write(
+            &global_alias_path,
+            r#"{
+  "mode": "deep_interview",
+  "active": true,
+  "session_id": "session-legacy-clear",
+  "updated_at": "2026-04-17T00:00:00Z",
+  "started_at": "2026-04-17T00:00:00Z",
+  "completed_at": null,
+  "context": {}
+}"#,
+        )
+        .expect("legacy alias-named global state should write");
+
+        let session_alias_path = workspace
+            .root
+            .join(".omx")
+            .join("state")
+            .join("sessions")
+            .join("session-legacy-clear")
+            .join("deep_interview-state.json");
+        fs::create_dir_all(session_alias_path.parent().expect("state parent"))
+            .expect("state parent should exist");
+        fs::write(
+            &session_alias_path,
+            r#"{
+  "mode": "deep_interview",
+  "active": true,
+  "session_id": "session-legacy-clear",
+  "updated_at": "2026-04-17T00:00:00Z",
+  "started_at": "2026-04-17T00:00:00Z",
+  "completed_at": null,
+  "context": {}
+}"#,
+        )
+        .expect("legacy alias-named session state should write");
+
+        assert!(store
+            .clear("deep-interview", Some("session-legacy-clear"))
+            .expect("alias clear should succeed"));
+        assert!(!global_alias_path.exists());
+        assert!(!session_alias_path.exists());
+        assert!(store
+            .read("deep-interview", Some("session-legacy-clear"))
+            .expect("session read should succeed")
+            .is_none());
+        assert!(store
+            .read("deep-interview", None)
+            .expect("global read should succeed")
             .is_none());
     }
 

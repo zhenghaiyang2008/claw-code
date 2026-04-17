@@ -9,6 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::omc_compat::{build_omc_handoff, normalize_mode_name, OmcCompatHandoff};
+
 static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 const DEFAULT_VERIFICATION_RUN_ID_PREFIX: &str = "verification-run";
 const FILE_LOCK_RETRY_ATTEMPTS: u32 = 100;
@@ -97,6 +99,8 @@ pub struct VerificationRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<OmcCompatHandoff>,
     pub status: VerificationStatus,
     pub acceptance_criteria: Vec<String>,
     #[serde(default)]
@@ -249,7 +253,7 @@ pub fn initialize_verification_record(
         .as_deref()
         .map(|value| normalize_existing_identifier("session_id", value))
         .transpose()?;
-    let mode = normalize_required_text("mode", &request.mode)?;
+    let mode = normalize_mode_name(&normalize_required_text("mode", &request.mode)?).to_string();
     let acceptance_criteria = normalize_acceptance_criteria(request.acceptance_criteria)?;
     let _lock = store.acquire_record_lock(&verification_run_id)?;
     if read_verification_record_unlocked(store, &verification_run_id)?.is_some() {
@@ -258,9 +262,10 @@ pub fn initialize_verification_record(
         )));
     }
     let record = VerificationRecord {
-        verification_run_id,
+        verification_run_id: verification_run_id.clone(),
         session_id,
         mode,
+        handoff: Some(build_verification_handoff(&verification_run_id)),
         status: VerificationStatus::Pending,
         acceptance_criteria,
         checks: Vec::new(),
@@ -345,7 +350,11 @@ fn read_verification_record_unlocked(
         return Ok(None);
     }
     let contents = fs::read_to_string(path)?;
-    let record = serde_json::from_str(&contents)?;
+    let mut record: VerificationRecord = serde_json::from_str(&contents)?;
+    record.mode = normalize_mode_name(&record.mode).to_string();
+    if record.handoff.is_none() {
+        record.handoff = Some(build_verification_handoff(&record.verification_run_id));
+    }
     Ok(Some(record))
 }
 
@@ -374,8 +383,20 @@ where
         ))
     })?;
     mutate(&mut record)?;
+    record.mode = normalize_mode_name(&record.mode).to_string();
+    if record.handoff.is_none() {
+        record.handoff = Some(build_verification_handoff(&record.verification_run_id));
+    }
     write_verification_record_unlocked(store, &record)?;
     Ok(record)
+}
+
+fn build_verification_handoff(verification_run_id: &str) -> OmcCompatHandoff {
+    build_omc_handoff(
+        None,
+        &[],
+        &format!(".omx/runtime/verification/{verification_run_id}.json"),
+    )
 }
 
 fn recompute_status(record: &VerificationRecord) -> VerificationStatus {
@@ -705,6 +726,13 @@ mod tests {
 
         assert_eq!(initialized.verification_run_id, "milestone-3-runtime");
         assert_eq!(initialized.status, VerificationStatus::Pending);
+        assert_eq!(
+            initialized
+                .handoff
+                .as_ref()
+                .map(|handoff| handoff.handoff_path.as_str()),
+            Some(".omx/runtime/verification/milestone-3-runtime.json")
+        );
 
         let restored = read_verification_record(&store, "milestone-3-runtime")
             .expect("record should read")
@@ -714,6 +742,77 @@ mod tests {
             .root
             .join(".omx/runtime/verification/milestone-3-runtime.json")
             .exists());
+    }
+
+    #[test]
+    fn read_backfills_handoff_for_legacy_verification_record() {
+        let workspace = TestWorkspace::new();
+        let store = workspace.store();
+        let path = store.record_path("legacy-run");
+        fs::create_dir_all(
+            path.parent()
+                .expect("verification record path should have parent"),
+        )
+        .expect("verification directory should exist");
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "verification_run_id": "legacy-run",
+                "session_id": "legacy-session",
+                "mode": "verification",
+                "status": "pending",
+                "acceptance_criteria": ["Backfill legacy handoff"],
+                "checks": [],
+                "updated_at": "2026-04-17T00:00:00Z"
+            }))
+            .expect("legacy record should serialize"),
+        )
+        .expect("legacy record should write");
+
+        let raw_before = fs::read_to_string(&path).expect("legacy record should exist");
+        assert!(!raw_before.contains("\"handoff\""));
+
+        let restored = read_verification_record(&store, "legacy-run")
+            .expect("record should read")
+            .expect("record should exist");
+        assert_eq!(
+            restored.handoff.as_ref().map(|handoff| handoff.handoff_path.as_str()),
+            Some(".omx/runtime/verification/legacy-run.json")
+        );
+
+        let raw_after = fs::read_to_string(&path).expect("legacy record should still exist");
+        assert!(!raw_after.contains("\"handoff\""));
+    }
+
+    #[test]
+    fn read_normalizes_legacy_aliased_mode_values() {
+        let workspace = TestWorkspace::new();
+        let store = workspace.store();
+        let path = store.record_path("legacy-mode-run");
+        fs::create_dir_all(
+            path.parent()
+                .expect("verification record path should have parent"),
+        )
+        .expect("verification directory should exist");
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "verification_run_id": "legacy-mode-run",
+                "session_id": "legacy-session",
+                "mode": "verifier",
+                "status": "pending",
+                "acceptance_criteria": ["Normalize legacy verification mode aliases"],
+                "checks": [],
+                "updated_at": "2026-04-17T00:00:00Z"
+            }))
+            .expect("legacy record should serialize"),
+        )
+        .expect("legacy record should write");
+
+        let restored = read_verification_record(&store, "legacy-mode-run")
+            .expect("record should read")
+            .expect("record should exist");
+        assert_eq!(restored.mode, "verification");
     }
 
     #[test]
@@ -789,6 +888,14 @@ mod tests {
         )
         .expect("record should initialize");
 
+        let record = read_verification_record(&store, "review-run")
+            .expect("record should read")
+            .expect("record should exist");
+        assert_eq!(
+            record.handoff.as_ref().map(|handoff| handoff.handoff_path.as_str()),
+            Some(".omx/runtime/verification/review-run.json")
+        );
+
         append_or_update_verification_check(
             &store,
             VerificationCheckUpdateRequest {
@@ -830,6 +937,25 @@ mod tests {
             restored.reviewer.map(|reviewer| reviewer.outcome),
             Some(VerificationReviewerOutcome::Approved)
         );
+    }
+
+    #[test]
+    fn normalizes_mode_name_when_initializing_record() {
+        let workspace = TestWorkspace::new();
+        let store = workspace.store();
+
+        let initialized = initialize_verification_record(
+            &store,
+            VerificationInitRequest {
+                verification_run_id: Some("normalized-mode".to_string()),
+                session_id: None,
+                mode: "Verifier".to_string(),
+                acceptance_criteria: vec!["Normalize OMC compatibility mode names".to_string()],
+            },
+        )
+        .expect("record should initialize");
+
+        assert_eq!(initialized.mode, "verification");
     }
 
     #[test]
