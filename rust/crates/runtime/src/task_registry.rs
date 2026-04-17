@@ -358,6 +358,14 @@ impl TaskRegistry {
     pub fn assign_team(&self, task_id: &str, team_id: &str) -> Result<(), String> {
         let team_id = team_id.to_owned();
         self.update_task(task_id, |task| {
+            if let Some(existing_team_id) = task.team_id.as_deref() {
+                if existing_team_id != team_id {
+                    return Err(format!(
+                        "task {task_id} is already assigned to team {existing_team_id}"
+                    ));
+                }
+                return Ok(());
+            }
             task.team_id = Some(team_id.clone());
             Ok(())
         })
@@ -900,6 +908,56 @@ mod tests {
         assert!(removed.is_some());
         assert!(registry.get(&task.task_id).is_none());
         assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn rejects_reassigning_task_to_different_team() {
+        let workspace = TestWorkspace::new();
+        let registry = workspace.registry();
+        let task = registry.create("Team task", None);
+
+        registry
+            .assign_team(&task.task_id, "team_alpha")
+            .expect("initial assignment should succeed");
+        let error = registry
+            .assign_team(&task.task_id, "team_beta")
+            .expect_err("reassignment should be rejected");
+
+        assert_eq!(
+            error,
+            format!("task {} is already assigned to team team_alpha", task.task_id)
+        );
+        assert_eq!(
+            registry
+                .get(&task.task_id)
+                .expect("task should still exist")
+                .team_id
+                .as_deref(),
+            Some("team_alpha")
+        );
+    }
+
+    #[test]
+    fn reassigning_task_to_same_team_is_idempotent() {
+        let workspace = TestWorkspace::new();
+        let registry = workspace.registry();
+        let task = registry.create("Team task", None);
+
+        registry
+            .assign_team(&task.task_id, "team_alpha")
+            .expect("initial assignment should succeed");
+        registry
+            .assign_team(&task.task_id, "team_alpha")
+            .expect("same-team reassignment should succeed");
+
+        assert_eq!(
+            registry
+                .get(&task.task_id)
+                .expect("task should still exist")
+                .team_id
+                .as_deref(),
+            Some("team_alpha")
+        );
     }
 
     #[test]

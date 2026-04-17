@@ -22,7 +22,7 @@ use runtime::{
     read_file,
     summary_compression::compress_summary_text,
     task_registry::{TaskRegistry, TaskRuntimeMetadata},
-    team_cron_registry::{CronRegistry, TeamRegistry},
+    team_cron_registry::{CronRegistry, TeamRegistry, TeamRuntimeMetadata},
     worker_boot::{WorkerReadySnapshot, WorkerRegistry, WorkerTaskReceipt},
     write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
     BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
@@ -47,12 +47,6 @@ fn global_mcp_registry() -> &'static McpToolRegistry {
     REGISTRY.get_or_init(McpToolRegistry::new)
 }
 
-fn global_team_registry() -> &'static TeamRegistry {
-    use std::sync::OnceLock;
-    static REGISTRY: OnceLock<TeamRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(TeamRegistry::new)
-}
-
 fn global_cron_registry() -> &'static CronRegistry {
     use std::sync::OnceLock;
     static REGISTRY: OnceLock<CronRegistry> = OnceLock::new();
@@ -73,6 +67,23 @@ fn current_workspace_task_registry() -> Result<TaskRegistry, String> {
     Ok(registries
         .entry(cwd.clone())
         .or_insert_with(|| TaskRegistry::for_workspace(cwd))
+        .clone())
+}
+
+fn current_workspace_team_registry() -> Result<TeamRegistry, String> {
+    use std::sync::{Mutex, OnceLock};
+
+    static REGISTRIES: OnceLock<Mutex<BTreeMap<PathBuf, TeamRegistry>>> = OnceLock::new();
+
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+    let registries = REGISTRIES.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut registries = registries
+        .lock()
+        .map_err(|_| String::from("team registry cache lock poisoned"))?;
+    Ok(registries
+        .entry(cwd.clone())
+        .or_insert_with(|| TeamRegistry::for_workspace(cwd))
         .clone())
 }
 
@@ -1074,10 +1085,10 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "prompt": { "type": "string" },
-                                "description": { "type": "string" }
+                                "task_id": { "type": "string" }
                             },
-                            "required": ["prompt"]
+                            "required": ["task_id"],
+                            "additionalProperties": false
                         }
                     }
                 },
@@ -1085,6 +1096,29 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "TeamGet",
+            description: "Get a persisted team by ID.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "team_id": { "type": "string" }
+                },
+                "required": ["team_id"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "TeamList",
+            description: "List persisted teams for the current workspace.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
             name: "TeamDelete",
@@ -1352,6 +1386,8 @@ fn execute_tool_with_enforcer(
         "WorkerObserveCompletion" => from_value::<WorkerObserveCompletionInput>(input)
             .and_then(run_worker_observe_completion),
         "TeamCreate" => from_value::<TeamCreateInput>(input).and_then(run_team_create),
+        "TeamGet" => from_value::<TeamIdInput>(input).and_then(run_team_get),
+        "TeamList" => run_team_list(input.clone()),
         "TeamDelete" => from_value::<TeamDeleteInput>(input).and_then(run_team_delete),
         "CronCreate" => from_value::<CronCreateInput>(input).and_then(run_cron_create),
         "CronDelete" => from_value::<CronDeleteInput>(input).and_then(run_cron_delete),
@@ -1750,30 +1786,71 @@ fn run_worker_observe_completion(input: WorkerObserveCompletionInput) -> Result<
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_team_create(input: TeamCreateInput) -> Result<String, String> {
-    let task_ids: Vec<String> = input
-        .tasks
-        .iter()
-        .filter_map(|t| t.get("task_id").and_then(|v| v.as_str()).map(str::to_owned))
-        .collect();
+    let task_ids: Vec<String> = input.tasks.into_iter().map(|task| task.task_id).collect();
+    validate_unique_team_task_ids(&task_ids)?;
     let task_registry = current_workspace_task_registry()?;
+    let team_registry = current_workspace_team_registry()?;
+    let mut shared_session_id: Option<String> = None;
+    let mut session_id_consistent = true;
+    let mut saw_task_without_session = false;
     for task_id in &task_ids {
-        if task_registry.try_get(task_id)?.is_none() {
-            return Err(format!("task not found: {task_id}"));
+        let task = task_registry
+            .try_get(task_id)?
+            .ok_or_else(|| format!("task not found: {task_id}"))?;
+        match (&shared_session_id, task.session_id.as_ref()) {
+            (None, Some(session_id)) => {
+                shared_session_id = Some(session_id.clone());
+            }
+            (Some(existing), Some(session_id)) if existing != session_id => {
+                session_id_consistent = false;
+            }
+            (Some(_), None) => {
+                session_id_consistent = false;
+            }
+            (None, None) => {
+                saw_task_without_session = true;
+            }
+            _ => {}
         }
     }
+    if !session_id_consistent || saw_task_without_session {
+        shared_session_id = None;
+    }
 
-    let team = global_team_registry().create(&input.name, task_ids);
+    let team = team_registry.create_with_metadata(
+        &input.name,
+        task_ids,
+        TeamRuntimeMetadata {
+            phase: Some(String::from("created")),
+            session_id: shared_session_id,
+        },
+    )?;
     let mut assigned_task_ids: Vec<String> = Vec::new();
-    // Register team assignment on each task
     for task_id in &team.task_ids {
         if let Err(error) = task_registry.assign_team(task_id, &team.team_id) {
+            let mut rollback_failures = Vec::new();
             for assigned_task_id in &assigned_task_ids {
-                let _ = task_registry.unassign_team(assigned_task_id);
+                if let Err(rollback_error) = task_registry.unassign_team(assigned_task_id) {
+                    rollback_failures.push(format!(
+                        "failed to unassign task {assigned_task_id}: {rollback_error}"
+                    ));
+                }
             }
-            let _ = global_team_registry().delete(&team.team_id);
-            return Err(format!(
-                "failed to assign task {task_id} to team {}: {error}",
-                team.team_id
+            match team_registry.try_remove(&team.team_id) {
+                Ok(Some(_)) => {}
+                Ok(None) => rollback_failures.push(String::from(
+                    "failed removing persisted team: team disappeared during rollback",
+                )),
+                Err(cleanup_error) => rollback_failures.push(format!(
+                    "failed removing persisted team: {cleanup_error}"
+                )),
+            }
+            return Err(with_rollback_failures(
+                format!(
+                    "failed to assign task {task_id} to team {}: {error}",
+                    team.team_id
+                ),
+                rollback_failures,
             ));
         }
         assigned_task_ids.push(task_id.clone());
@@ -1784,21 +1861,171 @@ fn run_team_create(input: TeamCreateInput) -> Result<String, String> {
         "task_count": team.task_ids.len(),
         "task_ids": team.task_ids,
         "status": team.status,
-        "created_at": team.created_at
+        "phase": team.phase,
+        "session_id": team.session_id,
+        "created_at": team.created_at,
+        "updated_at": team.updated_at
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_team_get(input: TeamIdInput) -> Result<String, String> {
+    let team_registry = current_workspace_team_registry()?;
+    match team_registry.try_get(&input.team_id)? {
+        Some(team) => to_pretty_json(json!({
+            "team_id": team.team_id,
+            "name": team.name,
+            "status": team.status,
+            "phase": team.phase,
+            "session_id": team.session_id,
+            "task_ids": team.task_ids,
+            "task_count": team.task_ids.len(),
+            "created_at": team.created_at,
+            "updated_at": team.updated_at
+        })),
+        None => Err(format!("team not found: {}", input.team_id)),
+    }
+}
+
+fn run_team_list(_input: Value) -> Result<String, String> {
+    let team_registry = current_workspace_team_registry()?;
+    let teams: Vec<_> = team_registry
+        .try_list()?
+        .into_iter()
+        .map(|team| {
+            json!({
+                "team_id": team.team_id,
+                "name": team.name,
+                "status": team.status,
+                "phase": team.phase,
+                "session_id": team.session_id,
+                "task_ids": team.task_ids,
+                "task_count": team.task_ids.len(),
+                "created_at": team.created_at,
+                "updated_at": team.updated_at
+            })
+        })
+        .collect();
+    to_pretty_json(json!({
+        "teams": teams,
+        "count": teams.len()
     }))
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_team_delete(input: TeamDeleteInput) -> Result<String, String> {
-    match global_team_registry().delete(&input.team_id) {
+    let task_registry = current_workspace_task_registry()?;
+    let team_registry = current_workspace_team_registry()?;
+    let team = team_registry
+        .try_get(&input.team_id)?
+        .ok_or_else(|| format!("team not found: {}", input.team_id))?;
+    let unassigned_task_ids = unassign_owned_team_tasks(
+        &team.task_ids,
+        &team.team_id,
+        |task_id| match task_registry.try_get(task_id)? {
+            Some(task) if task.team_id.as_deref() == Some(team.team_id.as_str()) => {
+                task_registry.unassign_team(task_id)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        },
+        |task_id| task_registry.assign_team(task_id, &team.team_id),
+    )?;
+
+    match team_registry.delete_with_task_ids(&input.team_id, Vec::new()) {
         Ok(team) => to_pretty_json(json!({
             "team_id": team.team_id,
             "name": team.name,
             "status": team.status,
+            "phase": team.phase,
+            "session_id": team.session_id,
+            "task_ids": team.task_ids,
+            "created_at": team.created_at,
+            "updated_at": team.updated_at,
             "message": "Team deleted"
         })),
-        Err(e) => Err(e),
+        Err(error) => {
+            let rollback_failures =
+                restore_team_assignments(&task_registry, &unassigned_task_ids, &team.team_id);
+            Err(with_rollback_failures(
+                format!("failed to delete team {}: {error}", input.team_id),
+                rollback_failures,
+            ))
+        }
     }
+}
+
+fn unassign_owned_team_tasks<F, G>(
+    task_ids: &[String],
+    team_id: &str,
+    mut unassign_if_owned: F,
+    mut restore_assignment: G,
+) -> Result<Vec<String>, String>
+where
+    F: FnMut(&str) -> Result<bool, String>,
+    G: FnMut(&str) -> Result<(), String>,
+{
+    let mut unassigned_task_ids = Vec::new();
+    for task_id in task_ids {
+        match unassign_if_owned(task_id) {
+            Ok(true) => unassigned_task_ids.push(task_id.clone()),
+            Ok(false) => {}
+            Err(error) => {
+                let rollback_failures = restore_team_assignments_with(
+                    &unassigned_task_ids,
+                    &mut restore_assignment,
+                );
+                return Err(with_rollback_failures(
+                    format!("failed to unassign task {task_id} from team {team_id}: {error}"),
+                    rollback_failures,
+                ));
+            }
+        }
+    }
+    Ok(unassigned_task_ids)
+}
+
+fn restore_team_assignments(
+    task_registry: &runtime::TaskRegistry,
+    task_ids: &[String],
+    team_id: &str,
+) -> Vec<String> {
+    restore_team_assignments_with(task_ids, |task_id| task_registry.assign_team(task_id, team_id))
+}
+
+fn restore_team_assignments_with<F>(task_ids: &[String], mut restore_assignment: F) -> Vec<String>
+where
+    F: FnMut(&str) -> Result<(), String>,
+{
+    let mut rollback_failures = Vec::new();
+    for task_id in task_ids {
+        if let Err(rollback_error) = restore_assignment(task_id) {
+            rollback_failures.push(format!(
+                "failed to restore team assignment for task {task_id}: {rollback_error}"
+            ));
+        }
+    }
+    rollback_failures
+}
+
+fn with_rollback_failures(error: String, rollback_failures: Vec<String>) -> String {
+    if rollback_failures.is_empty() {
+        error
+    } else {
+        format!("{error}; rollback failed: {}", rollback_failures.join("; "))
+    }
+}
+
+fn validate_unique_team_task_ids(task_ids: &[String]) -> Result<(), String> {
+    let mut seen = BTreeSet::new();
+    for task_id in task_ids {
+        if !seen.insert(task_id) {
+            return Err(format!(
+                "duplicate task_id is not allowed in TeamCreate: {task_id}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -2709,12 +2936,26 @@ const fn default_deep_interview_threshold() -> f64 {
 }
 
 #[derive(Debug, Deserialize)]
-struct TeamCreateInput {
-    name: String,
-    tasks: Vec<Value>,
+#[serde(deny_unknown_fields)]
+struct TeamTaskInput {
+    task_id: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TeamCreateInput {
+    name: String,
+    tasks: Vec<TeamTaskInput>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TeamIdInput {
+    team_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TeamDeleteInput {
     team_id: String,
 }
@@ -6421,9 +6662,11 @@ mod tests {
         final_assistant_text, global_cron_registry, maybe_commit_provenance, mvp_tool_specs,
         permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
         run_task_create, run_task_get, run_task_output, run_task_packet, run_task_update,
-        AgentInput, AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass,
-        ProviderRuntimeClient, SubagentToolExecutor, TaskCreateInput, TaskIdInput,
-        TaskUpdateInput,
+        run_team_create, run_team_delete, unassign_owned_team_tasks, AgentInput, AgentJob,
+        GlobalToolRegistry,
+        LaneEventName, LaneFailureClass, ProviderRuntimeClient, SubagentToolExecutor,
+        TaskCreateInput, TaskIdInput, TaskUpdateInput, TeamCreateInput, TeamDeleteInput,
+        TeamTaskInput,
     };
     use api::OutputContentBlock;
     use runtime::ProviderFallbackConfig;
@@ -6462,6 +6705,37 @@ mod tests {
             .expect("time")
             .as_nanos();
         std::env::temp_dir().join(format!("clawd-tools-{unique}-{name}"))
+    }
+
+    fn task_file_path(workspace: &Path, task_id: &str) -> PathBuf {
+        workspace
+            .join(".omx/runtime/tasks")
+            .join(format!("{task_id}.json"))
+    }
+
+    fn team_file_path(workspace: &Path, team_id: &str) -> PathBuf {
+        workspace
+            .join(".omx/runtime/teams")
+            .join(format!("{team_id}.json"))
+    }
+
+    fn wait_for_task_team_assignment_state(
+        task_path: &Path,
+        expect_assigned: bool,
+        attempts: usize,
+    ) -> bool {
+        for _ in 0..attempts {
+            if let Ok(contents) = fs::read_to_string(task_path) {
+                if let Ok(task_json) = serde_json::from_str::<serde_json::Value>(&contents) {
+                    let is_assigned = task_json["team_id"].as_str().is_some();
+                    if is_assigned == expect_assigned {
+                        return true;
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        false
     }
 
     fn run_git(cwd: &Path, args: &[&str]) {
@@ -6531,6 +6805,8 @@ mod tests {
         assert!(names.contains(&"WorkerObserve"));
         assert!(names.contains(&"WorkerAwaitReady"));
         assert!(names.contains(&"WorkerSendPrompt"));
+        assert!(names.contains(&"TeamGet"));
+        assert!(names.contains(&"TeamList"));
     }
 
     #[test]
@@ -10149,18 +10425,637 @@ printf 'pwsh:%s' "$1"
 
     #[test]
     fn run_team_create_rejects_missing_task_before_creating_team() {
-        let before = crate::global_team_registry().len();
+        let _guard = env_guard();
+        let workspace = temp_path("team-create-missing");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("set workspace");
+
+        let before = crate::current_workspace_team_registry()
+            .expect("team registry")
+            .len();
         let error = crate::run_team_create(crate::TeamCreateInput {
             name: "milestone-one".to_string(),
-            tasks: vec![json!({ "task_id": "missing-task" })],
+            tasks: vec![TeamTaskInput {
+                task_id: "missing-task".to_string(),
+            }],
         })
         .expect_err("missing task should reject team creation");
 
         assert_eq!(error, "invalid task id: missing-task");
         assert_eq!(
-            crate::global_team_registry().len(),
+            crate::current_workspace_team_registry()
+                .expect("team registry")
+                .len(),
             before,
             "team count should not change on pre-validation failure"
+        );
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn run_team_create_rejects_duplicate_task_ids_before_persisting_team() {
+        let _guard = env_guard();
+        let workspace = temp_path("team-duplicate-task-ids");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("set workspace");
+
+        let task = run_task_create(TaskCreateInput {
+            prompt: "team task".to_string(),
+            description: Some("linkage".to_string()),
+            session_id: Some("session-team".to_string()),
+            dependencies: Vec::new(),
+            artifacts: Vec::new(),
+        })
+        .expect("task should be created");
+        let task_json: serde_json::Value = serde_json::from_str(&task).expect("json");
+        let task_id = task_json["task_id"].as_str().expect("task id").to_string();
+
+        let error = run_team_create(TeamCreateInput {
+            name: "runtime-m1".to_string(),
+            tasks: vec![
+                TeamTaskInput {
+                    task_id: task_id.clone(),
+                },
+                TeamTaskInput { task_id },
+            ],
+        })
+        .expect_err("duplicate task ids should be rejected");
+
+        assert_eq!(
+            error,
+            format!("duplicate task_id is not allowed in TeamCreate: {}", task_json["task_id"].as_str().expect("task id"))
+        );
+        let team_registry = runtime::team_cron_registry::TeamRegistry::for_workspace(&workspace);
+        assert!(
+            team_registry.is_empty(),
+            "duplicate task ids must not persist a team record"
+        );
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn run_team_create_and_delete_persist_task_linkage() {
+        let _guard = env_guard();
+        let workspace = temp_path("team-linkage-tools");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("set workspace");
+
+        let first = run_task_create(TaskCreateInput {
+            prompt: "team task one".to_string(),
+            description: Some("linkage".to_string()),
+            session_id: Some("session-team".to_string()),
+            dependencies: Vec::new(),
+            artifacts: Vec::new(),
+        })
+        .expect("first task should be created");
+        let second = run_task_create(TaskCreateInput {
+            prompt: "team task two".to_string(),
+            description: Some("linkage".to_string()),
+            session_id: Some("session-team".to_string()),
+            dependencies: Vec::new(),
+            artifacts: Vec::new(),
+        })
+        .expect("second task should be created");
+
+        let first_json: serde_json::Value = serde_json::from_str(&first).expect("json");
+        let second_json: serde_json::Value = serde_json::from_str(&second).expect("json");
+        let first_id = first_json["task_id"].as_str().expect("task id").to_string();
+        let second_id = second_json["task_id"].as_str().expect("task id").to_string();
+
+        let created = run_team_create(TeamCreateInput {
+            name: "runtime-m1".to_string(),
+            tasks: vec![
+                TeamTaskInput { task_id: first_id },
+                TeamTaskInput { task_id: second_id },
+            ],
+        })
+        .expect("team create should succeed");
+        let created_json: serde_json::Value = serde_json::from_str(&created).expect("json");
+        let team_id = created_json["team_id"]
+            .as_str()
+            .expect("team id")
+            .to_string();
+
+        assert_eq!(created_json["status"], "created");
+        assert_eq!(created_json["phase"], "created");
+        assert_eq!(created_json["session_id"], "session-team");
+        assert!(looks_like_rfc3339(
+            created_json["created_at"].as_str().expect("created_at")
+        ));
+
+        let task_registry = runtime::TaskRegistry::for_workspace(&workspace);
+        let team_registry = runtime::team_cron_registry::TeamRegistry::for_workspace(&workspace);
+        assert_eq!(
+            task_registry
+                .get(first_json["task_id"].as_str().expect("task id"))
+                .expect("first task")
+                .team_id
+                .as_deref(),
+            Some(team_id.as_str())
+        );
+        assert_eq!(
+            task_registry
+                .get(second_json["task_id"].as_str().expect("task id"))
+                .expect("second task")
+                .team_id
+                .as_deref(),
+            Some(team_id.as_str())
+        );
+        let persisted_team = team_registry.get(&team_id).expect("team should persist");
+        assert_eq!(persisted_team.task_ids, vec![
+            first_json["task_id"].as_str().expect("task id").to_string(),
+            second_json["task_id"].as_str().expect("task id").to_string()
+        ]);
+
+        let deleted = run_team_delete(TeamDeleteInput {
+            team_id: team_id.clone(),
+        })
+        .expect("team delete should succeed");
+        let deleted_json: serde_json::Value = serde_json::from_str(&deleted).expect("json");
+        assert_eq!(deleted_json["status"], "deleted");
+        assert_eq!(deleted_json["phase"], "deleted");
+        assert_eq!(
+            deleted_json["task_ids"]
+                .as_array()
+                .expect("task_ids should be an array")
+                .len(),
+            0
+        );
+
+        assert!(
+            task_registry
+                .get(first_json["task_id"].as_str().expect("task id"))
+                .expect("first task")
+                .team_id
+                .is_none()
+        );
+        assert!(
+            task_registry
+                .get(second_json["task_id"].as_str().expect("task id"))
+                .expect("second task")
+                .team_id
+                .is_none()
+        );
+        let persisted_deleted_team = team_registry
+            .get(&team_id)
+            .expect("team should still exist after soft delete");
+        assert_eq!(
+            persisted_deleted_team.status,
+            runtime::team_cron_registry::TeamStatus::Deleted
+        );
+        assert!(persisted_deleted_team.task_ids.is_empty());
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn team_create_schema_requires_task_ids() {
+        let team_create = mvp_tool_specs()
+            .into_iter()
+            .find(|spec| spec.name == "TeamCreate")
+            .expect("TeamCreate spec should exist");
+
+        assert_eq!(
+            team_create.input_schema["properties"]["tasks"]["items"]["required"],
+            json!(["task_id"])
+        );
+        assert!(
+            team_create.input_schema["properties"]["tasks"]["items"]["properties"]["task_id"]
+                .is_object()
+        );
+        assert!(
+            team_create.input_schema["properties"]["tasks"]["items"]["properties"]["prompt"]
+                .is_null()
+        );
+    }
+
+    #[test]
+    fn team_create_validation_rejects_legacy_prompt_tasks() {
+        let error = execute_tool(
+            "TeamCreate",
+            &json!({
+                "name": "legacy-shape",
+                "tasks": [
+                    { "prompt": "old team task shape" }
+                ]
+            }),
+        )
+        .expect_err("legacy prompt-based team tasks should be rejected");
+
+        assert!(
+            error.contains("task_id") || error.contains("prompt"),
+            "unexpected validation error: {error}"
+        );
+    }
+
+    #[test]
+    fn execute_team_get_and_list_return_persisted_teams() {
+        let _guard = env_guard();
+        let workspace = temp_path("team-get-list");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("set workspace");
+
+        let created = run_team_create(TeamCreateInput {
+            name: "persisted-team".to_string(),
+            tasks: Vec::new(),
+        })
+        .expect("team create should succeed");
+        let created_json: serde_json::Value = serde_json::from_str(&created).expect("json");
+        let team_id = created_json["team_id"]
+            .as_str()
+            .expect("team id")
+            .to_string();
+
+        let fetched = execute_tool("TeamGet", &json!({ "team_id": team_id.clone() }))
+            .expect("TeamGet should succeed");
+        let fetched_json: serde_json::Value = serde_json::from_str(&fetched).expect("json");
+        assert_eq!(fetched_json["team_id"], team_id);
+        assert_eq!(fetched_json["name"], "persisted-team");
+        assert_eq!(fetched_json["task_count"], 0);
+
+        let listed = execute_tool("TeamList", &json!({})).expect("TeamList should succeed");
+        let listed_json: serde_json::Value = serde_json::from_str(&listed).expect("json");
+        assert_eq!(listed_json["count"], 1);
+        assert_eq!(listed_json["teams"][0]["team_id"], team_id);
+        assert_eq!(listed_json["teams"][0]["name"], "persisted-team");
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn execute_team_list_does_not_repair_index_in_read_only_flow() {
+        let _guard = env_guard();
+        let workspace = temp_path("team-list-read-only");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("set workspace");
+
+        let created = run_team_create(TeamCreateInput {
+            name: "persisted-team".to_string(),
+            tasks: Vec::new(),
+        })
+        .expect("team create should succeed");
+        let created_json: serde_json::Value = serde_json::from_str(&created).expect("json");
+        let team_id = created_json["team_id"]
+            .as_str()
+            .expect("team id")
+            .to_string();
+        let index_path = workspace.join(".omx/runtime/indexes/teams.json");
+        fs::remove_file(&index_path).expect("test should remove persisted index");
+
+        let listed = execute_tool("TeamList", &json!({})).expect("TeamList should succeed");
+        let listed_json: serde_json::Value = serde_json::from_str(&listed).expect("json");
+        assert_eq!(listed_json["count"], 1);
+        assert_eq!(listed_json["teams"][0]["team_id"], team_id);
+        assert!(
+            !index_path.exists(),
+            "TeamList should not repair the index during a read-only flow"
+        );
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn execute_team_get_and_list_surface_persisted_team_corruption() {
+        let _guard = env_guard();
+        let workspace = temp_path("team-get-list-corruption");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("set workspace");
+
+        let created = run_team_create(TeamCreateInput {
+            name: "persisted-team".to_string(),
+            tasks: Vec::new(),
+        })
+        .expect("team create should succeed");
+        let created_json: serde_json::Value = serde_json::from_str(&created).expect("json");
+        let team_id = created_json["team_id"]
+            .as_str()
+            .expect("team id")
+            .to_string();
+        let team_path = workspace
+            .join(".omx/runtime/teams")
+            .join(format!("{team_id}.json"));
+        fs::write(
+            &team_path,
+            format!(
+                r#"{{
+  "team_id": "{team_id}",
+  "name": "persisted-team",
+  "status": "created",
+  "phase": "created",
+  "task_ids": ["task_dup", "task_dup"],
+  "created_at": "2026-04-16T12:00:00Z",
+  "updated_at": "2026-04-16T12:00:00Z"
+}}"#
+            ),
+        )
+        .expect("corrupt team file should write");
+
+        let get_error = execute_tool("TeamGet", &json!({ "team_id": team_id.clone() }))
+            .expect_err("TeamGet should surface team corruption");
+        assert!(get_error.contains("duplicate task_id task_dup is not allowed"));
+
+        let list_error =
+            execute_tool("TeamList", &json!({})).expect_err("TeamList should surface team corruption");
+        assert!(list_error.contains("duplicate task_id task_dup is not allowed"));
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn run_team_create_rejects_tasks_already_linked_to_other_team() {
+        let _guard = env_guard();
+        let workspace = temp_path("team-reassign-protection");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("set workspace");
+
+        let task = run_task_create(TaskCreateInput {
+            prompt: "protected task".to_string(),
+            description: Some("linkage".to_string()),
+            session_id: Some("session-team".to_string()),
+            dependencies: Vec::new(),
+            artifacts: Vec::new(),
+        })
+        .expect("task should be created");
+        let task_json: serde_json::Value = serde_json::from_str(&task).expect("json");
+        let task_id = task_json["task_id"].as_str().expect("task id").to_string();
+
+        let first_team = run_team_create(TeamCreateInput {
+            name: "alpha".to_string(),
+            tasks: vec![TeamTaskInput {
+                task_id: task_id.clone(),
+            }],
+        })
+        .expect("initial team create should succeed");
+        let first_team_json: serde_json::Value = serde_json::from_str(&first_team).expect("json");
+        let first_team_id = first_team_json["team_id"]
+            .as_str()
+            .expect("team id")
+            .to_string();
+
+        let before_team_count = runtime::team_cron_registry::TeamRegistry::for_workspace(&workspace).len();
+        let error = run_team_create(TeamCreateInput {
+            name: "beta".to_string(),
+            tasks: vec![TeamTaskInput {
+                task_id: task_id.clone(),
+            }],
+        })
+        .expect_err("cross-team reassignment should be rejected");
+
+        assert!(error.contains(&format!("failed to assign task {task_id} to team")));
+        assert!(error.contains(&format!(
+            "task {task_id} is already assigned to team {first_team_id}"
+        )));
+        let task_registry = runtime::TaskRegistry::for_workspace(&workspace);
+        assert_eq!(
+            task_registry
+                .get(&task_id)
+                .expect("task should still exist")
+                .team_id
+                .as_deref(),
+            Some(first_team_id.as_str())
+        );
+        let team_registry = runtime::team_cron_registry::TeamRegistry::for_workspace(&workspace);
+        assert_eq!(
+            team_registry.len(),
+            before_team_count,
+            "failed reassignment should not leave an extra team record"
+        );
+        assert_eq!(team_registry.list().len(), 1);
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn run_team_create_surfaces_rollback_unassign_failures() {
+        let _guard = env_guard();
+        let workspace = temp_path("team-create-rollback-failure");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("set workspace");
+
+        let first = run_task_create(TaskCreateInput {
+            prompt: "first team task".to_string(),
+            description: Some("rollback".to_string()),
+            session_id: Some("session-team".to_string()),
+            dependencies: Vec::new(),
+            artifacts: Vec::new(),
+        })
+        .expect("first task should be created");
+        let first_json: serde_json::Value = serde_json::from_str(&first).expect("json");
+        let first_task_id = first_json["task_id"].as_str().expect("task id").to_string();
+
+        let mut tasks = vec![TeamTaskInput {
+            task_id: first_task_id.clone(),
+        }];
+        for index in 0..32 {
+            let created = run_task_create(TaskCreateInput {
+                prompt: format!("extra team task {index}"),
+                description: Some("rollback".to_string()),
+                session_id: Some("session-team".to_string()),
+                dependencies: Vec::new(),
+                artifacts: Vec::new(),
+            })
+            .expect("extra task should be created");
+            let created_json: serde_json::Value = serde_json::from_str(&created).expect("json");
+            tasks.push(TeamTaskInput {
+                task_id: created_json["task_id"]
+                    .as_str()
+                    .expect("task id")
+                    .to_string(),
+            });
+        }
+
+        let blocked = run_task_create(TaskCreateInput {
+            prompt: "blocked team task".to_string(),
+            description: Some("rollback".to_string()),
+            session_id: Some("session-team".to_string()),
+            dependencies: Vec::new(),
+            artifacts: Vec::new(),
+        })
+        .expect("blocked task should be created");
+        let blocked_json: serde_json::Value = serde_json::from_str(&blocked).expect("json");
+        let blocked_task_id = blocked_json["task_id"].as_str().expect("task id").to_string();
+
+        let existing = run_team_create(TeamCreateInput {
+            name: "existing-team".to_string(),
+            tasks: vec![TeamTaskInput {
+                task_id: blocked_task_id.clone(),
+            }],
+        })
+        .expect("existing team should be created");
+        let existing_json: serde_json::Value = serde_json::from_str(&existing).expect("json");
+        let existing_team_id = existing_json["team_id"]
+            .as_str()
+            .expect("team id")
+            .to_string();
+
+        tasks.push(TeamTaskInput {
+            task_id: blocked_task_id.clone(),
+        });
+
+        let first_task_path = task_file_path(&workspace, &first_task_id);
+        let sabotager = thread::spawn({
+            let first_task_path = first_task_path.clone();
+            move || {
+                if !wait_for_task_team_assignment_state(&first_task_path, true, 5_000) {
+                    return false;
+                }
+                fs::remove_file(&first_task_path).expect("sabotage should remove first task file");
+                true
+            }
+        });
+
+        let error = run_team_create(TeamCreateInput {
+            name: "runtime-m1".to_string(),
+            tasks,
+        })
+        .expect_err("rollback failure should be surfaced");
+
+        assert!(
+            sabotager.join().expect("sabotager should join"),
+            "test should sabotage the first task before rollback completes"
+        );
+        assert!(error.contains(&format!(
+            "failed to assign task {blocked_task_id} to team"
+        )));
+        assert!(error.contains(&format!(
+            "task {blocked_task_id} is already assigned to team {existing_team_id}"
+        )));
+        assert!(error.contains("rollback failed:"));
+        assert!(error.contains(&format!(
+            "failed to unassign task {first_task_id}: task not found: {first_task_id}"
+        )));
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn run_team_delete_surfaces_rollback_reassign_failures() {
+        let _guard = env_guard();
+        let workspace = temp_path("team-delete-rollback-failure");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("set workspace");
+
+        let first = run_task_create(TaskCreateInput {
+            prompt: "first delete task".to_string(),
+            description: Some("rollback".to_string()),
+            session_id: Some("session-team".to_string()),
+            dependencies: Vec::new(),
+            artifacts: Vec::new(),
+        })
+        .expect("first task should be created");
+        let first_json: serde_json::Value = serde_json::from_str(&first).expect("json");
+        let first_task_id = first_json["task_id"].as_str().expect("task id").to_string();
+
+        let mut tasks = vec![TeamTaskInput {
+            task_id: first_task_id.clone(),
+        }];
+        for index in 0..32 {
+            let created = run_task_create(TaskCreateInput {
+                prompt: format!("delete task {index}"),
+                description: Some("rollback".to_string()),
+                session_id: Some("session-team".to_string()),
+                dependencies: Vec::new(),
+                artifacts: Vec::new(),
+            })
+            .expect("extra task should be created");
+            let created_json: serde_json::Value = serde_json::from_str(&created).expect("json");
+            tasks.push(TeamTaskInput {
+                task_id: created_json["task_id"]
+                    .as_str()
+                    .expect("task id")
+                    .to_string(),
+            });
+        }
+
+        let created = run_team_create(TeamCreateInput {
+            name: "runtime-m1".to_string(),
+            tasks,
+        })
+        .expect("team create should succeed");
+        let created_json: serde_json::Value = serde_json::from_str(&created).expect("json");
+        let team_id = created_json["team_id"].as_str().expect("team id").to_string();
+
+        let first_task_path = task_file_path(&workspace, &first_task_id);
+        let team_path = team_file_path(&workspace, &team_id);
+        let sabotager = thread::spawn({
+            let first_task_path = first_task_path.clone();
+            let team_path = team_path.clone();
+            move || {
+                if !wait_for_task_team_assignment_state(&first_task_path, false, 5_000) {
+                    return false;
+                }
+                fs::remove_file(&first_task_path).expect("sabotage should remove first task file");
+                fs::remove_file(&team_path).expect("sabotage should remove team file");
+                fs::create_dir_all(&team_path).expect("sabotage should replace team file with dir");
+                true
+            }
+        });
+
+        let error = run_team_delete(TeamDeleteInput {
+            team_id: team_id.clone(),
+        })
+        .expect_err("rollback reassign failure should be surfaced");
+
+        assert!(
+            sabotager.join().expect("sabotager should join"),
+            "test should sabotage delete rollback before delete completes"
+        );
+        assert!(error.contains(&format!("failed to delete team {team_id}:")));
+        assert!(error.contains("rollback failed:"));
+        assert!(error.contains(&format!(
+            "failed to restore team assignment for task {first_task_id}: task not found: {first_task_id}"
+        )));
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn run_team_delete_restores_earlier_unassignments_when_mid_loop_unassign_fails() {
+        let mut restored = Vec::new();
+        let error = unassign_owned_team_tasks(
+            &[
+                String::from("task_alpha"),
+                String::from("task_bravo"),
+                String::from("task_charlie"),
+            ],
+            "team_demo",
+            |task_id| match task_id {
+                "task_alpha" => Ok(true),
+                "task_bravo" => Err(String::from("task not found: task_bravo")),
+                "task_charlie" => Ok(true),
+                other => panic!("unexpected task id: {other}"),
+            },
+            |task_id: &str| {
+                restored.push(task_id.to_string());
+                Ok(())
+            },
+        )
+        .expect_err("mid-loop unassign failure should be surfaced");
+
+        assert_eq!(restored, vec![String::from("task_alpha")]);
+        assert_eq!(
+            error,
+            "failed to unassign task task_bravo from team team_demo: task not found: task_bravo"
         );
     }
 
