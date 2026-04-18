@@ -3678,6 +3678,52 @@ mod tests {
         let _ = fs::remove_dir_all(home_root);
     }
 
+    #[test]
+    fn claude_home_plugin_discovery_does_not_change_registry_or_install_paths() {
+        let _guard = env_guard();
+        let config_home = temp_dir("claude-home-plugin-paths-config");
+        let bundled_root = temp_dir("claude-home-plugin-paths-bundled");
+        let home_root = temp_dir("claude-home-plugin-paths-home");
+        let plugin_root = home_root.join(".claude").join("plugins").join("home-demo");
+
+        write_file(
+            plugin_root.join(MANIFEST_RELATIVE_PATH).as_path(),
+            r#"{
+  "name": "home-demo",
+  "version": "1.0.0",
+  "description": "Claude home plugin",
+  "permissions": ["read"]
+}"#,
+        );
+
+        let original_home = std::env::var_os("HOME");
+        let original_claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
+        std::env::set_var("HOME", &home_root);
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+        let config = PluginManagerConfig::new(config_home.clone());
+        let mut config = config;
+        config.bundled_root = Some(bundled_root.clone());
+        let manager = PluginManager::new(config);
+        let _ = manager.plugin_registry().expect("registry should load");
+
+        assert_eq!(manager.install_root(), config_home.join("plugins").join("installed"));
+        assert_eq!(manager.registry_path(), config_home.join("plugins").join("installed.json"));
+        assert_eq!(manager.settings_path(), config_home.join("settings.json"));
+
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_claude_config_dir {
+            Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(bundled_root);
+        let _ = fs::remove_dir_all(home_root);
+    }
+
     /// Regression test for ROADMAP #41: verify that `CLAW_CONFIG_HOME` isolation prevents
     /// host `~/.claw/plugins/` from bleeding into test runs.
     #[test]
