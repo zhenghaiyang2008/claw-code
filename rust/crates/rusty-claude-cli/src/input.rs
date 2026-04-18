@@ -65,17 +65,31 @@ impl Completer for SlashCommandHelper {
             return Ok((0, Vec::new()));
         };
 
-        let matches = self
-            .completions
-            .iter()
-            .filter(|candidate| candidate.starts_with(prefix))
+        let matches = filter_completion_candidates(&self.completions, prefix)
+            .into_iter()
             .map(|candidate| Pair {
                 display: candidate.clone(),
-                replacement: candidate.clone(),
+                replacement: candidate,
             })
             .collect();
 
         Ok((0, matches))
+    }
+}
+
+pub(crate) fn filter_completion_candidates(completions: &[String], prefix: &str) -> Vec<String> {
+    if prefix == "/" {
+        completions
+            .iter()
+            .filter(|candidate| !candidate.contains(' '))
+            .cloned()
+            .collect()
+    } else {
+        completions
+            .iter()
+            .filter(|candidate| candidate.starts_with(prefix))
+            .cloned()
+            .collect()
     }
 }
 
@@ -221,7 +235,9 @@ fn normalize_completions(completions: Vec<String>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{slash_command_prefix, LineEditor, SlashCommandHelper};
+    use super::{
+        filter_completion_candidates, slash_command_prefix, LineEditor, SlashCommandHelper,
+    };
     use rustyline::completion::Completer;
     use rustyline::highlight::Highlighter;
     use rustyline::history::{DefaultHistory, History};
@@ -263,6 +279,40 @@ mod tests {
     }
 
     #[test]
+    fn slash_only_completion_lists_all_top_level_commands() {
+        let helper = SlashCommandHelper::new(vec![
+            "/help".to_string(),
+            "/status".to_string(),
+            "/mcp".to_string(),
+            "/mcp list".to_string(),
+            "/model".to_string(),
+            "/model opus".to_string(),
+            "/session".to_string(),
+            "/session switch alpha".to_string(),
+        ]);
+        let history = DefaultHistory::new();
+        let ctx = Context::new(&history);
+        let (start, matches) = helper
+            .complete("/", 1, &ctx)
+            .expect("completion should work");
+
+        assert_eq!(start, 0);
+        assert_eq!(
+            matches
+                .into_iter()
+                .map(|candidate| candidate.replacement)
+                .collect::<Vec<_>>(),
+            vec![
+                "/help".to_string(),
+                "/status".to_string(),
+                "/mcp".to_string(),
+                "/model".to_string(),
+                "/session".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn completes_matching_slash_command_arguments() {
         let helper = SlashCommandHelper::new(vec![
             "/model".to_string(),
@@ -284,6 +334,30 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["/model opus".to_string()]
         );
+    }
+
+    #[test]
+    fn slash_only_special_case_does_not_change_prefixed_matching() {
+        let helper = SlashCommandHelper::new(vec![
+            "/mcp".to_string(),
+            "/mcp list".to_string(),
+            "/model".to_string(),
+            "/model opus".to_string(),
+        ]);
+        let history = DefaultHistory::new();
+        let ctx = Context::new(&history);
+        let (_, matches) = helper
+            .complete("/m", 2, &ctx)
+            .expect("completion should work");
+        let values = matches
+            .into_iter()
+            .map(|candidate| candidate.replacement)
+            .collect::<Vec<_>>();
+
+        assert!(values.contains(&"/mcp".to_string()));
+        assert!(values.contains(&"/mcp list".to_string()));
+        assert!(values.contains(&"/model".to_string()));
+        assert!(values.contains(&"/model opus".to_string()));
     }
 
     #[test]
@@ -326,5 +400,28 @@ mod tests {
 
         let helper = editor.editor.helper().expect("helper should exist");
         assert_eq!(helper.completions, vec!["/model opus".to_string()]);
+    }
+
+    #[test]
+    fn slash_only_filter_keeps_only_single_segment_commands() {
+        let filtered = filter_completion_candidates(
+            &[
+                "/help".to_string(),
+                "/mcp".to_string(),
+                "/mcp list".to_string(),
+                "/session".to_string(),
+                "/session switch alpha".to_string(),
+            ],
+            "/",
+        );
+
+        assert_eq!(
+            filtered,
+            vec![
+                "/help".to_string(),
+                "/mcp".to_string(),
+                "/session".to_string(),
+            ]
+        );
     }
 }

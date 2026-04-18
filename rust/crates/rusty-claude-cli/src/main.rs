@@ -8393,6 +8393,7 @@ mod tests {
         STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
+    use crate::input::filter_completion_candidates;
     use plugins::{
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
     };
@@ -10072,6 +10073,22 @@ mod tests {
         assert!(completions.contains(&"/resume session-old".to_string()));
         assert!(completions.contains(&"/mcp list".to_string()));
         assert!(completions.contains(&"/ultraplan ".to_string()));
+    }
+
+    #[test]
+    fn slash_only_completion_uses_top_level_candidates_from_repl_source() {
+        let completions = slash_command_completion_candidates_with_sessions(
+            "sonnet",
+            Some("session-current"),
+            vec!["session-old".to_string()],
+        );
+
+        let values = filter_completion_candidates(&completions, "/");
+
+        assert!(values.contains(&"/help".to_string()));
+        assert!(values.contains(&"/mcp".to_string()));
+        assert!(values.contains(&"/skills".to_string()));
+        assert!(!values.iter().any(|value| value.contains(' ')));
     }
 
     #[test]
