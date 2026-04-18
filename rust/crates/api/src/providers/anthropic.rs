@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -740,9 +741,50 @@ fn now_unix_timestamp() -> u64 {
 fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {
     match std::env::var(key) {
         Ok(value) if !value.is_empty() => Ok(Some(value)),
-        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(super::dotenv_value(key)),
+        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(
+            super::dotenv_value(key).or_else(|| read_claude_settings_env_non_empty(key)),
+        ),
         Err(error) => Err(ApiError::from(error)),
     }
+}
+
+fn read_claude_settings_env_non_empty(key: &str) -> Option<String> {
+    for path in claude_settings_paths() {
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&contents) else {
+            continue;
+        };
+
+        let direct = value.get(key).and_then(Value::as_str).map(str::trim);
+        if let Some(candidate) = direct.filter(|value| !value.is_empty()) {
+            return Some(candidate.to_string());
+        }
+
+        let env_value = value
+            .get("env")
+            .and_then(Value::as_object)
+            .and_then(|env| env.get(key))
+            .and_then(Value::as_str)
+            .map(str::trim);
+        if let Some(candidate) = env_value.filter(|value| !value.is_empty()) {
+            return Some(candidate.to_string());
+        }
+    }
+
+    None
+}
+
+fn claude_settings_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(claude_config_dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+        paths.push(PathBuf::from(claude_config_dir).join("settings.json"));
+    }
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        paths.push(PathBuf::from(home).join(".claude").join("settings.json"));
+    }
+    paths
 }
 
 #[cfg(test)]
@@ -763,7 +805,10 @@ fn read_auth_token() -> Option<String> {
 
 #[must_use]
 pub fn read_base_url() -> String {
-    std::env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string())
+    read_env_non_empty("ANTHROPIC_BASE_URL")
+        .ok()
+        .and_then(std::convert::identity)
+        .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
 }
 
 fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
@@ -1144,6 +1189,107 @@ mod tests {
         assert_eq!(auth.bearer_token(), Some("auth-token"));
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    fn auth_token_falls_back_to_claude_settings_env() {
+        let _guard = env_lock();
+        let home_root = std::env::temp_dir().join("api-anthropic-claude-home-auth");
+        let claude_dir = home_root.join(".claude");
+        std::fs::create_dir_all(&claude_dir).expect("claude dir");
+        std::fs::write(
+            claude_dir.join("settings.json"),
+            r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"claude-settings-token"}}"#,
+        )
+        .expect("write settings");
+
+        let original_home = std::env::var_os("HOME");
+        let original_claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
+        std::env::set_var("HOME", &home_root);
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+
+        let auth = AuthSource::from_env().expect("settings auth");
+        assert_eq!(auth.bearer_token(), Some("claude-settings-token"));
+
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_claude_config_dir {
+            Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(home_root);
+    }
+
+    #[test]
+    fn anthropic_base_url_falls_back_to_claude_settings_env() {
+        let _guard = env_lock();
+        let home_root = std::env::temp_dir().join("api-anthropic-claude-home-base-url");
+        let claude_dir = home_root.join(".claude");
+        std::fs::create_dir_all(&claude_dir).expect("claude dir");
+        std::fs::write(
+            claude_dir.join("settings.json"),
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://claude-settings.example"}}"#,
+        )
+        .expect("write settings");
+
+        let original_home = std::env::var_os("HOME");
+        let original_claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
+        std::env::set_var("HOME", &home_root);
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        std::env::remove_var("ANTHROPIC_BASE_URL");
+
+        assert_eq!(super::read_base_url(), "https://claude-settings.example");
+
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_claude_config_dir {
+            Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(home_root);
+    }
+
+    #[test]
+    fn explicit_env_vars_override_claude_settings_env() {
+        let _guard = env_lock();
+        let home_root = std::env::temp_dir().join("api-anthropic-claude-home-precedence");
+        let claude_dir = home_root.join(".claude");
+        std::fs::create_dir_all(&claude_dir).expect("claude dir");
+        std::fs::write(
+            claude_dir.join("settings.json"),
+            r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"claude-settings-token","ANTHROPIC_BASE_URL":"https://claude-settings.example"}}"#,
+        )
+        .expect("write settings");
+
+        let original_home = std::env::var_os("HOME");
+        let original_claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
+        std::env::set_var("HOME", &home_root);
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        std::env::set_var("ANTHROPIC_AUTH_TOKEN", "env-token");
+        std::env::set_var("ANTHROPIC_BASE_URL", "https://env.example");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+
+        let auth = AuthSource::from_env().expect("env auth");
+        assert_eq!(auth.bearer_token(), Some("env-token"));
+        assert_eq!(super::read_base_url(), "https://env.example");
+
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_claude_config_dir {
+            Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::remove_var("ANTHROPIC_BASE_URL");
+        let _ = std::fs::remove_dir_all(home_root);
     }
 
     #[test]
