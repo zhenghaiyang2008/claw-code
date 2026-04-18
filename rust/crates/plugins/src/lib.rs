@@ -1086,6 +1086,9 @@ impl PluginManager {
             self.discover_external_directory_plugins_with_failures(&discovery.plugins)?;
         discovery.extend(external);
 
+        let claude_user = self.discover_claude_user_plugins_with_failures(&discovery.plugins)?;
+        discovery.extend(claude_user);
+
         Ok(self.build_registry_report(discovery))
     }
 
@@ -1348,6 +1351,43 @@ impl PluginManager {
                             error,
                         ));
                     }
+                }
+            }
+        }
+
+        Ok(discovery)
+    }
+
+    fn discover_claude_user_plugins_with_failures(
+        &self,
+        existing_plugins: &[PluginDefinition],
+    ) -> Result<PluginDiscovery, PluginError> {
+        let mut discovery = PluginDiscovery::default();
+
+        for root in discover_claude_user_plugin_dirs()? {
+            let source = format!("claude-home:{}", root.display());
+            match load_plugin_definition(
+                &root,
+                PluginKind::External,
+                source.clone(),
+                EXTERNAL_MARKETPLACE,
+            ) {
+                Ok(plugin) => {
+                    if existing_plugins
+                        .iter()
+                        .chain(discovery.plugins.iter())
+                        .all(|existing| existing.metadata().id != plugin.metadata().id)
+                    {
+                        discovery.push_plugin(plugin);
+                    }
+                }
+                Err(error) => {
+                    discovery.push_failure(PluginLoadFailure::new(
+                        root,
+                        PluginKind::External,
+                        source,
+                        error,
+                    ));
                 }
             }
         }
@@ -2183,6 +2223,28 @@ fn discover_plugin_dirs(root: &Path) -> Result<Vec<PathBuf>, PluginError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(error) => Err(PluginError::Io(error)),
     }
+}
+
+fn discover_claude_user_plugin_dirs() -> Result<Vec<PathBuf>, PluginError> {
+    let mut roots = Vec::new();
+
+    if let Ok(claude_config_dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+        roots.push(PathBuf::from(claude_config_dir).join("plugins"));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        roots.push(PathBuf::from(home).join(".claude").join("plugins"));
+    }
+
+    let mut discovered = Vec::new();
+    for root in roots {
+        for path in discover_plugin_dirs(&root)? {
+            if !discovered.iter().any(|existing| existing == &path) {
+                discovered.push(path);
+            }
+        }
+    }
+
+    Ok(discovered)
 }
 
 fn plugin_id(name: &str, marketplace: &str) -> String {
@@ -3515,6 +3577,54 @@ mod tests {
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(bundled_root);
+    }
+
+    #[test]
+    fn list_installed_plugins_discovers_claude_home_packaged_plugins() {
+        let _guard = env_guard();
+        let config_home = temp_dir("claude-home-plugin-config");
+        let bundled_root = temp_dir("claude-home-plugin-bundled");
+        let home_root = temp_dir("claude-home-plugin-home");
+        let claude_plugins_root = home_root.join(".claude").join("plugins");
+        let plugin_root = claude_plugins_root.join("home-demo");
+
+        write_file(
+            plugin_root.join(MANIFEST_RELATIVE_PATH).as_path(),
+            r#"{
+  "name": "home-demo",
+  "version": "1.0.0",
+  "description": "Claude home plugin",
+  "permissions": ["read"]
+}"#,
+        );
+
+        let original_home = std::env::var_os("HOME");
+        let original_claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
+        std::env::set_var("HOME", &home_root);
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+        let mut config = PluginManagerConfig::new(&config_home);
+        config.bundled_root = Some(bundled_root.clone());
+        let manager = PluginManager::new(config);
+        let installed = manager
+            .list_plugins()
+            .expect("plugin registry should discover Claude home plugins");
+
+        assert!(installed
+            .iter()
+            .any(|plugin| plugin.metadata.id == "home-demo@external"));
+
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_claude_config_dir {
+            Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(bundled_root);
+        let _ = fs::remove_dir_all(home_root);
     }
 
     /// Regression test for ROADMAP #41: verify that `CLAW_CONFIG_HOME` isolation prevents
