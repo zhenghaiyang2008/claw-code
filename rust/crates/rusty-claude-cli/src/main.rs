@@ -3771,6 +3771,17 @@ impl LiveCli {
                 Ok(())
             }
             Err(error) => {
+                if should_keep_repl_alive_after_turn_error(&error) {
+                    self.replace_runtime(runtime)?;
+                    spinner.fail(
+                        "⏹ Request cancelled",
+                        TerminalRenderer::new().color_theme(),
+                        &mut stdout,
+                    )?;
+                    println!();
+                    self.persist_session()?;
+                    return Ok(());
+                }
                 runtime.shutdown_plugins()?;
                 spinner.fail(
                     "❌ Request failed",
@@ -7074,6 +7085,10 @@ fn format_user_visible_api_error(session_id: &str, error: &api::ApiError) -> Str
     }
 }
 
+fn should_keep_repl_alive_after_turn_error(error: &RuntimeError) -> bool {
+    error.to_string().contains("request cancelled by Ctrl+C")
+}
+
 fn format_context_window_blocked_error(session_id: &str, error: &api::ApiError) -> String {
     let mut lines = vec![
         "Context window blocked".to_string(),
@@ -8334,6 +8349,7 @@ mod tests {
         render_prompt_history_report, render_repl_help, render_resume_usage,
         render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
         resolve_repl_model, resolve_session_reference, response_to_events,
+        should_keep_repl_alive_after_turn_error,
         resume_supported_slash_commands, run_resume_command, short_tool_id,
         slash_command_completion_candidates_with_sessions, status_context,
         summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt, validate_no_args,
@@ -8348,7 +8364,8 @@ mod tests {
     };
     use runtime::{
         load_oauth_credentials, save_oauth_credentials, AssistantEvent, ConfigLoader, ContentBlock,
-        ConversationMessage, MessageRole, OAuthConfig, PermissionMode, Session, ToolExecutor,
+        ConversationMessage, MessageRole, OAuthConfig, PermissionMode, RuntimeError, Session,
+        ToolExecutor,
     };
     use serde_json::json;
     use std::fs;
@@ -10047,6 +10064,16 @@ mod tests {
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
         std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    fn repl_keeps_running_for_ctrl_c_cancellation_errors() {
+        assert!(should_keep_repl_alive_after_turn_error(&RuntimeError::new(
+            "request cancelled by Ctrl+C"
+        )));
+        assert!(!should_keep_repl_alive_after_turn_error(&RuntimeError::new(
+            "provider failed"
+        )));
     }
 
     #[test]
