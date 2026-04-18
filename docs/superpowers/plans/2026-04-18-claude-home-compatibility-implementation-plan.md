@@ -1,38 +1,38 @@
-# `~/.claude` Home Compatibility Implementation Plan
+# `~/.claude` Home Compatibility 实施计划
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **给代理执行者：** 必须使用 superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans 按任务逐项实现本计划。步骤使用复选框（`- [ ]`）跟踪。
 
-**Goal:** Make `claw` load and use `~/.claude` skills, agents, commands, and MCP server config through the existing claw-native discovery and config systems.
+**目标：** 让 `claw` 通过现有 claw-native 的发现与配置系统，加载并使用 `~/.claude` 中的 skills、agents、commands，以及 MCP server 配置。
 
-**Architecture:** Extend the current `commands` discovery layer and `runtime::ConfigLoader` rather than creating a second Claude-specific runtime. Keep project-over-user precedence, keep `~/.claude/commands` as legacy command / skill sources, and keep all `~/.claude` sources read-only in this cycle. Plugin compatibility is explicitly deferred but recorded in the approved design.
+**架构：** 扩展当前 `commands` 发现层与 `runtime::ConfigLoader`，而不是创建第二套 Claude 专用运行时。保持“项目级优先于用户级”的既有优先级；保持 `~/.claude/commands` 作为 legacy command / skill 来源；本轮中所有 `~/.claude` 来源都保持只读兼容。插件兼容明确延期，但在已批准的设计中保留后续计划。
 
-**Tech Stack:** Rust workspace (`commands`, `runtime`, `tools`, `rusty-claude-cli`), existing `ConfigLoader`, existing skill/agent discovery functions, existing `execute_agent_with_spawn` runtime path, cargo test/cargo check.
+**技术栈：** Rust workspace（`commands`、`runtime`、`tools`、`rusty-claude-cli`）、现有 `ConfigLoader`、现有 skill/agent 发现函数、现有 `execute_agent_with_spawn` 执行路径、`cargo test` / `cargo check`。
 
 ---
 
-## File structure and responsibility map
+## 文件结构与职责划分
 
 - `rust/crates/runtime/src/config.rs`
-  - Extend config discovery so `~/.claude/settings.json` and `CLAUDE_CONFIG_DIR/settings.json` participate in the existing config merge chain for `mcpServers`.
+  - 扩展配置发现逻辑，使 `~/.claude/settings.json` 与 `CLAUDE_CONFIG_DIR/settings.json` 能通过现有配置合并链参与 `mcpServers` 加载。
 - `rust/crates/commands/src/lib.rs`
-  - Normalize and document `~/.claude` discovery/reporting behavior for skills, legacy commands, and agents.
-  - Update help/reporting strings so management surfaces describe the new MCP source chain accurately.
+  - 规范并补强 `~/.claude` 在 skills、legacy commands、agents 上的发现与展示行为。
+  - 更新帮助文本与报告输出，让管理面准确说明新的 MCP 来源链。
 - `rust/crates/tools/src/lib.rs`
-  - Ensure the runtime-facing skill lookup compatibility roots and agent execution tests cover `~/.claude` sourced definitions.
+  - 确保运行时 skill lookup 的兼容根路径与 agent 执行测试覆盖 `~/.claude` 来源定义。
 - `docs/superpowers/specs/2026-04-18-claude-home-compatibility-design.md`
-  - Approved design artifact; reference only, do not rewrite during implementation.
+  - 已批准的设计文档；实现时引用，不要改写。
 
-This plan intentionally avoids touching `rust/crates/plugins/src/lib.rs` in this cycle. Plugins remain a deferred follow-up.
+本计划**刻意不修改** `rust/crates/plugins/src/lib.rs`。plugins 保持为后续子项目。
 
 ---
 
-### Task 1: Add Claude user config files to the MCP merge chain
+### 任务 1：把 Claude 用户配置文件纳入 MCP 合并链
 
-**Files:**
-- Modify: `rust/crates/runtime/src/config.rs`
-- Test: `rust/crates/runtime/src/config.rs`
+**文件：**
+- 修改：`rust/crates/runtime/src/config.rs`
+- 测试：`rust/crates/runtime/src/config.rs`
 
-- [ ] **Step 1: Write the failing config discovery test for Claude MCP sources**
+- [ ] **步骤 1：先写一个会失败的 Claude MCP 来源发现测试**
 
 ```rust
 #[test]
@@ -64,12 +64,12 @@ fn loads_and_merges_claude_home_mcp_servers_by_precedence() {
 }
 ```
 
-- [ ] **Step 2: Run the targeted config test to verify it fails first**
+- [ ] **步骤 2：运行定向测试，确认它先失败**
 
-Run: `cd rust && cargo test -p runtime loads_and_merges_claude_home_mcp_servers_by_precedence -- --nocapture`
-Expected: FAIL because `ConfigLoader::discover()` does not yet include `~/.claude/settings.json`.
+运行：`cd rust && cargo test -p runtime loads_and_merges_claude_home_mcp_servers_by_precedence -- --nocapture`
+预期：**FAIL**，因为 `ConfigLoader::discover()` 目前还没有把 `~/.claude/settings.json` 纳入发现链。
 
-- [ ] **Step 3: Extend `ConfigLoader::discover()` with Claude user config entries**
+- [ ] **步骤 3：扩展 `ConfigLoader::discover()`，加入 Claude 用户配置项**
 
 ```rust
 pub fn discover(&self) -> Vec<ConfigEntry> {
@@ -127,7 +127,7 @@ pub fn discover(&self) -> Vec<ConfigEntry> {
 }
 ```
 
-- [ ] **Step 4: Add precedence assertions for Claude config in the existing merge test**
+- [ ] **步骤 4：在现有 merge 测试中补充 Claude 配置优先级断言**
 
 ```rust
 assert!(loaded.mcp().get("claude-home").is_some());
@@ -138,12 +138,12 @@ assert!(loaded
     .any(|entry| entry.path.ends_with(Path::new(".claude/settings.json"))));
 ```
 
-- [ ] **Step 5: Run the targeted runtime config verification**
+- [ ] **步骤 5：运行 runtime 配置相关定向验证**
 
-Run: `cd rust && cargo test -p runtime config -- --nocapture`
-Expected: PASS, including the new Claude MCP discovery test and existing precedence tests.
+运行：`cd rust && cargo test -p runtime config -- --nocapture`
+预期：**PASS**，包括新的 Claude MCP 来源测试和现有优先级测试都通过。
 
-- [ ] **Step 6: Commit the config merge change**
+- [ ] **步骤 6：提交本任务**
 
 ```bash
 git add rust/crates/runtime/src/config.rs
@@ -152,13 +152,13 @@ git commit -m "Load Claude home MCP config through the existing merge chain"
 
 ---
 
-### Task 2: Lock in `~/.claude` skills and legacy commands as visible, shadow-aware discovery sources
+### 任务 2：锁定 `~/.claude` skills 与 legacy commands 的可见性、覆盖显示与来源表达
 
-**Files:**
-- Modify: `rust/crates/commands/src/lib.rs`
-- Test: `rust/crates/commands/src/lib.rs`
+**文件：**
+- 修改：`rust/crates/commands/src/lib.rs`
+- 测试：`rust/crates/commands/src/lib.rs`
 
-- [ ] **Step 1: Add a failing report test for user Claude skills + legacy commands**
+- [ ] **步骤 1：为 Claude 用户级 skills + legacy commands 写一个会失败的报告测试**
 
 ```rust
 #[test]
@@ -184,12 +184,12 @@ fn lists_claude_home_skills_and_legacy_commands_with_shadowing() {
 }
 ```
 
-- [ ] **Step 2: Run the targeted commands test to verify baseline behavior**
+- [ ] **步骤 2：运行定向 commands 测试，确认基线是否不足**
 
-Run: `cd rust && cargo test -p commands lists_claude_home_skills_and_legacy_commands_with_shadowing -- --nocapture`
-Expected: FAIL if report text or root handling does not yet fully match the approved spec wording.
+运行：`cd rust && cargo test -p commands lists_claude_home_skills_and_legacy_commands_with_shadowing -- --nocapture`
+预期：如果报告文本、来源标签或 root 处理与已批准设计不完全一致，则先 **FAIL**。
 
-- [ ] **Step 3: Normalize the user-facing `/skills` help text to mention Claude config sources explicitly**
+- [ ] **步骤 3：规范 `/skills` 帮助文本，让 Claude 配置来源表达清楚**
 
 ```rust
 fn render_skills_usage(unexpected: Option<&str>) -> String {
@@ -208,19 +208,19 @@ fn render_skills_usage(unexpected: Option<&str>) -> String {
 }
 ```
 
-- [ ] **Step 4: Add JSON/report assertions for the Claude user source id**
+- [ ] **步骤 4：补充 JSON/report 断言，锁定 Claude 用户来源标识**
 
 ```rust
 assert_eq!(report["skills"][0]["source"]["scope"], "user_home");
 assert_eq!(report["skills"][0]["source"]["id"], "user_claude");
 ```
 
-- [ ] **Step 5: Run the commands discovery and help regression suite**
+- [ ] **步骤 5：运行 commands 的发现与帮助回归测试**
 
-Run: `cd rust && cargo test -p commands -- --nocapture`
-Expected: PASS, including existing `/skills`, `/agents`, and `/mcp` help/report tests.
+运行：`cd rust && cargo test -p commands -- --nocapture`
+预期：**PASS**，现有 `/skills`、`/agents`、`/mcp` 的帮助与报告测试都通过。
 
-- [ ] **Step 6: Commit the discovery/reporting update**
+- [ ] **步骤 6：提交本任务**
 
 ```bash
 git add rust/crates/commands/src/lib.rs
@@ -229,15 +229,15 @@ git commit -m "Clarify Claude home discovery in skills and command reporting"
 
 ---
 
-### Task 3: Make `~/.claude` skills, commands, and agents usable through the existing execution paths
+### 任务 3：让 `~/.claude` skills、commands、agents 能走通现有执行链路
 
-**Files:**
-- Modify: `rust/crates/tools/src/lib.rs`
-- Modify: `rust/crates/commands/src/lib.rs`
-- Test: `rust/crates/tools/src/lib.rs`
-- Test: `rust/crates/commands/src/lib.rs`
+**文件：**
+- 修改：`rust/crates/tools/src/lib.rs`
+- 修改：`rust/crates/commands/src/lib.rs`
+- 测试：`rust/crates/tools/src/lib.rs`
+- 测试：`rust/crates/commands/src/lib.rs`
 
-- [ ] **Step 1: Add a failing tool-side skill resolution test for `~/.claude/commands`**
+- [ ] **步骤 1：先加一个会失败的 tools 侧 skill 解析测试，覆盖 `~/.claude/commands`**
 
 ```rust
 #[test]
@@ -258,12 +258,12 @@ fn resolve_skill_path_from_compat_roots_finds_claude_home_legacy_commands() {
 }
 ```
 
-- [ ] **Step 2: Run the targeted tools test to verify it fails first**
+- [ ] **步骤 2：运行 tools 定向测试，确认它先失败**
 
-Run: `cd rust && cargo test -p tools resolve_skill_path_from_compat_roots_finds_claude_home_legacy_commands -- --nocapture`
-Expected: FAIL if the compat root order or command resolution does not yet cover the test case.
+运行：`cd rust && cargo test -p tools resolve_skill_path_from_compat_roots_finds_claude_home_legacy_commands -- --nocapture`
+预期：如果 compat roots 或 command resolution 还不完整，则 **FAIL**。
 
-- [ ] **Step 3: Extend tool-side compat roots to mirror commands-side Claude paths exactly**
+- [ ] **步骤 3：补齐 tools 侧兼容 roots，使其与 commands 侧 Claude 路径完全对齐**
 
 ```rust
 fn push_home_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, home: &Path) {
@@ -278,7 +278,7 @@ fn push_home_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, home: &Path) {
 }
 ```
 
-- [ ] **Step 4: Add an execution-path test for Claude-sourced agents entering the spawn path**
+- [ ] **步骤 4：添加一个 Claude agent 进入 spawn 路径的执行测试**
 
 ```rust
 #[test]
@@ -308,12 +308,12 @@ fn agents_loaded_from_claude_home_enter_existing_spawn_path() {
 }
 ```
 
-- [ ] **Step 5: Run the targeted usability verification**
+- [ ] **步骤 5：运行可用性验证**
 
-Run: `cd rust && cargo test -p tools -- --nocapture`
-Expected: PASS, including Claude command resolution and agent spawn-path coverage.
+运行：`cd rust && cargo test -p tools -- --nocapture`
+预期：**PASS**，包括 Claude command resolution 与 agent spawn 路径覆盖都通过。
 
-- [ ] **Step 6: Commit the execution-path compatibility change**
+- [ ] **步骤 6：提交本任务**
 
 ```bash
 git add rust/crates/tools/src/lib.rs rust/crates/commands/src/lib.rs
@@ -322,14 +322,14 @@ git commit -m "Keep Claude home definitions usable through existing execution pa
 
 ---
 
-### Task 4: Expose Claude MCP sources consistently in management surfaces and finish with regression evidence
+### 任务 4：让 Claude MCP 来源在管理面里表达一致，并收敛最终回归验证
 
-**Files:**
-- Modify: `rust/crates/commands/src/lib.rs`
-- Test: `rust/crates/commands/src/lib.rs`
-- Test: `rust/crates/runtime/src/config.rs`
+**文件：**
+- 修改：`rust/crates/commands/src/lib.rs`
+- 测试：`rust/crates/commands/src/lib.rs`
+- 测试：`rust/crates/runtime/src/config.rs`
 
-- [ ] **Step 1: Add a failing `/mcp help` source-string test for Claude config files**
+- [ ] **步骤 1：先写一个会失败的 `/mcp help` 来源字符串测试**
 
 ```rust
 #[test]
@@ -340,12 +340,12 @@ fn mcp_usage_mentions_claude_settings_sources() {
 }
 ```
 
-- [ ] **Step 2: Run the targeted help test to verify it fails first**
+- [ ] **步骤 2：运行定向帮助测试，确认它先失败**
 
-Run: `cd rust && cargo test -p commands mcp_usage_mentions_claude_settings_sources -- --nocapture`
-Expected: FAIL because the help text currently only lists `.claw/settings.json` and `.claw/settings.local.json`.
+运行：`cd rust && cargo test -p commands mcp_usage_mentions_claude_settings_sources -- --nocapture`
+预期：**FAIL**，因为当前帮助文本只列出了 `.claw/settings.json` 和 `.claw/settings.local.json`。
 
-- [ ] **Step 3: Update MCP help/report strings to describe the merged Claude user sources**
+- [ ] **步骤 3：更新 MCP 帮助/报告文本，说明 Claude 用户级来源链**
 
 ```rust
 fn render_mcp_usage(unexpected: Option<&str>) -> String {
@@ -361,7 +361,7 @@ fn render_mcp_usage(unexpected: Option<&str>) -> String {
 }
 ```
 
-- [ ] **Step 4: Add a merged-report test showing Claude MCP servers through `/mcp show`**
+- [ ] **步骤 4：添加一个 merged-report 测试，证明 Claude MCP server 能通过 `/mcp show` 暴露**
 
 ```rust
 #[test]
@@ -388,12 +388,12 @@ fn render_mcp_report_includes_claude_home_servers() {
 }
 ```
 
-- [ ] **Step 5: Run the full targeted regression commands for this feature set**
+- [ ] **步骤 5：运行本功能集的最终定向回归**
 
-Run: `cd rust && cargo test -p runtime config -- --nocapture && cargo test -p commands -- --nocapture && cargo test -p tools -- --nocapture && cargo check -p runtime -p commands -p tools -p rusty-claude-cli --quiet && git diff --check`
-Expected: PASS with Claude home discovery, usability, and MCP reporting covered and no formatting/check regressions.
+运行：`cd rust && cargo test -p runtime config -- --nocapture && cargo test -p commands -- --nocapture && cargo test -p tools -- --nocapture && cargo check -p runtime -p commands -p tools -p rusty-claude-cli --quiet && git diff --check`
+预期：**PASS**，Claude home 的发现、可用性、MCP 报告都被覆盖，且无 check/格式回归。
 
-- [ ] **Step 6: Commit the final management-surface and regression update**
+- [ ] **步骤 6：提交本任务**
 
 ```bash
 git add rust/crates/runtime/src/config.rs rust/crates/commands/src/lib.rs rust/crates/tools/src/lib.rs
@@ -402,25 +402,25 @@ git commit -m "Finish Claude home compatibility for discovery, usability, and MC
 
 ---
 
-## Self-review checklist
+## 自检清单
 
-- [ ] Spec coverage confirmed:
-  - `~/.claude/skills` discovery + usability covered by Tasks 2 and 3
-  - `~/.claude/agents` discovery + real execution-path coverage covered by Tasks 2 and 3
-  - `~/.claude/commands` legacy-command compatibility covered by Tasks 2 and 3
-  - `~/.claude/settings.json` / `CLAUDE_CONFIG_DIR/settings.json` MCP merge covered by Tasks 1 and 4
-  - plugins explicitly deferred and not accidentally pulled into the task list
-- [ ] Placeholder scan complete: no TBD/TODO/"implement later" text remains
-- [ ] Type consistency checked:
-  - `ConfigLoader::discover()` remains the single discovery source for config entries
-  - `resolve_skill_path()` and compat root helpers use the same `~/.claude` directories as `discover_skill_roots()`
-  - agent execution continues to use `execute_agent_with_spawn()` rather than inventing a new runtime path
+- [ ] 已确认 spec 覆盖：
+  - `~/.claude/skills` 的发现 + 可用性由任务 2、3 覆盖
+  - `~/.claude/agents` 的发现 + 真正执行链路由任务 2、3 覆盖
+  - `~/.claude/commands` 的 legacy-command 兼容由任务 2、3 覆盖
+  - `~/.claude/settings.json` / `CLAUDE_CONFIG_DIR/settings.json` 的 MCP 合并由任务 1、4 覆盖
+  - plugins 被明确延期，未误入本轮任务
+- [ ] 已完成占位词扫描：没有 TBD / TODO / “以后补”
+- [ ] 类型与边界一致性已检查：
+  - `ConfigLoader::discover()` 仍是唯一配置来源发现入口
+  - `resolve_skill_path()` 与 compat roots 使用的 Claude 路径与 `discover_skill_roots()` 对齐
+  - agent 执行继续复用 `execute_agent_with_spawn()`，不引入新运行时路径
 
-## Execution handoff
+## 执行交接
 
-Plan complete and saved to `docs/superpowers/plans/2026-04-18-claude-home-compatibility-implementation-plan.md`. Two execution options:
+计划已保存到 `docs/superpowers/plans/2026-04-18-claude-home-compatibility-implementation-plan.md`。两种执行方式：
 
-1. **Subagent-Driven (recommended)** - I dispatch a fresh subagent per task, review between tasks, fast iteration
-2. **Inline Execution** - Execute tasks in this session using executing-plans, batch execution with checkpoints
+1. **Subagent-Driven（推荐）** —— 每个任务派发一个全新 subagent，中间带评审，迭代快
+2. **Inline Execution** —— 在当前会话里用 executing-plans 按批次执行
 
-Which approach?
+你选哪一种？
