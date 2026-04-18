@@ -61,7 +61,7 @@ impl Completer for SlashCommandHelper {
         pos: usize,
         _ctx: &Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
-        let Some(prefix) = slash_command_prefix(line, pos) else {
+        let Some(prefix) = workflow_completion_prefix(line, pos) else {
             return Ok((0, Vec::new()));
         };
 
@@ -78,9 +78,10 @@ impl Completer for SlashCommandHelper {
 }
 
 pub(crate) fn filter_completion_candidates(completions: &[String], prefix: &str) -> Vec<String> {
-    if prefix == "/" {
+    if prefix == "/" || prefix == "$" {
         completions
             .iter()
+            .filter(|candidate| candidate.starts_with(prefix))
             .filter(|candidate| !candidate.contains(' '))
             .cloned()
             .collect()
@@ -211,13 +212,13 @@ impl LineEditor {
     }
 }
 
-fn slash_command_prefix(line: &str, pos: usize) -> Option<&str> {
+fn workflow_completion_prefix(line: &str, pos: usize) -> Option<&str> {
     if pos != line.len() {
         return None;
     }
 
     let prefix = &line[..pos];
-    if !prefix.starts_with('/') {
+    if !(prefix.starts_with('/') || prefix.starts_with('$')) {
         return None;
     }
 
@@ -228,7 +229,7 @@ fn normalize_completions(completions: Vec<String>) -> Vec<String> {
     let mut seen = BTreeSet::new();
     completions
         .into_iter()
-        .filter(|candidate| candidate.starts_with('/'))
+        .filter(|candidate| candidate.starts_with('/') || candidate.starts_with('$'))
         .filter(|candidate| seen.insert(candidate.clone()))
         .collect()
 }
@@ -236,7 +237,7 @@ fn normalize_completions(completions: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_completion_candidates, slash_command_prefix, LineEditor, SlashCommandHelper,
+        filter_completion_candidates, workflow_completion_prefix, LineEditor, SlashCommandHelper,
     };
     use rustyline::completion::Completer;
     use rustyline::highlight::Highlighter;
@@ -244,15 +245,17 @@ mod tests {
     use rustyline::Context;
 
     #[test]
-    fn extracts_terminal_slash_command_prefixes_with_arguments() {
-        assert_eq!(slash_command_prefix("/he", 3), Some("/he"));
-        assert_eq!(slash_command_prefix("/help me", 8), Some("/help me"));
+    fn extracts_terminal_workflow_prefixes_with_arguments() {
+        assert_eq!(workflow_completion_prefix("/he", 3), Some("/he"));
+        assert_eq!(workflow_completion_prefix("/help me", 8), Some("/help me"));
         assert_eq!(
-            slash_command_prefix("/session switch ses", 19),
+            workflow_completion_prefix("/session switch ses", 19),
             Some("/session switch ses")
         );
-        assert_eq!(slash_command_prefix("hello", 5), None);
-        assert_eq!(slash_command_prefix("/help", 2), None);
+        assert_eq!(workflow_completion_prefix("$br", 3), Some("$br"));
+        assert_eq!(workflow_completion_prefix("$brainstorming plan", 19), Some("$brainstorming plan"));
+        assert_eq!(workflow_completion_prefix("hello", 5), None);
+        assert_eq!(workflow_completion_prefix("/help", 2), None);
     }
 
     #[test]
@@ -373,6 +376,48 @@ mod tests {
     }
 
     #[test]
+    fn dollar_only_completion_lists_all_top_level_skills() {
+        let helper = SlashCommandHelper::new(vec![
+            "$brainstorming".to_string(),
+            "$deep-interview".to_string(),
+            "$plan next".to_string(),
+            "/help".to_string(),
+        ]);
+        let history = DefaultHistory::new();
+        let ctx = Context::new(&history);
+        let (start, matches) = helper.complete("$", 1, &ctx).expect("completion should work");
+
+        assert_eq!(start, 0);
+        assert_eq!(
+            matches
+                .into_iter()
+                .map(|candidate| candidate.replacement)
+                .collect::<Vec<_>>(),
+            vec!["$brainstorming".to_string(), "$deep-interview".to_string()]
+        );
+    }
+
+    #[test]
+    fn completes_matching_skill_prefixes() {
+        let helper = SlashCommandHelper::new(vec![
+            "$brainstorming".to_string(),
+            "$build-fix".to_string(),
+            "$deep-interview".to_string(),
+        ]);
+        let history = DefaultHistory::new();
+        let ctx = Context::new(&history);
+        let (_, matches) = helper.complete("$br", 3, &ctx).expect("completion should work");
+
+        assert_eq!(
+            matches
+                .into_iter()
+                .map(|candidate| candidate.replacement)
+                .collect::<Vec<_>>(),
+            vec!["$brainstorming".to_string()]
+        );
+    }
+
+    #[test]
     fn tracks_current_buffer_through_highlighter() {
         let helper = SlashCommandHelper::new(Vec::new());
         let _ = helper.highlight("draft", 5);
@@ -395,11 +440,15 @@ mod tests {
         editor.set_completions(vec![
             "/model opus".to_string(),
             "/model opus".to_string(),
+            "$brainstorming".to_string(),
             "status".to_string(),
         ]);
 
         let helper = editor.editor.helper().expect("helper should exist");
-        assert_eq!(helper.completions, vec!["/model opus".to_string()]);
+        assert_eq!(
+            helper.completions,
+            vec!["/model opus".to_string(), "$brainstorming".to_string()]
+        );
     }
 
     #[test]
@@ -422,6 +471,24 @@ mod tests {
                 "/mcp".to_string(),
                 "/session".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn dollar_only_filter_keeps_only_single_segment_skills() {
+        let filtered = filter_completion_candidates(
+            &[
+                "$brainstorming".to_string(),
+                "$deep-interview".to_string(),
+                "$plan next".to_string(),
+                "/help".to_string(),
+            ],
+            "$",
+        );
+
+        assert_eq!(
+            filtered,
+            vec!["$brainstorming".to_string(), "$deep-interview".to_string()]
         );
     }
 }

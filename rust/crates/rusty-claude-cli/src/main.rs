@@ -35,7 +35,8 @@ use commands::{
     handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
     handle_skills_slash_command, handle_skills_slash_command_json, render_slash_command_help,
     render_slash_command_help_filtered, resolve_skill_invocation, resume_supported_slash_commands,
-    slash_command_specs, validate_slash_command_input, SkillSlashDispatch, SlashCommand,
+    skill_completion_candidates, slash_command_specs, validate_slash_command_input,
+    SkillSlashDispatch, SlashCommand,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
@@ -785,14 +786,20 @@ fn removed_auth_surface_error(command_name: &str) -> String {
     )
 }
 
-fn try_resolve_bare_skill_prompt(cwd: &Path, trimmed: &str) -> Option<String> {
+fn try_resolve_skill_prompt(cwd: &Path, trimmed: &str) -> Option<String> {
     let bare_first_token = trimmed.split_whitespace().next().unwrap_or_default();
-    let looks_like_skill_name = !bare_first_token.is_empty()
+    let looks_like_explicit_skill = bare_first_token.starts_with('$')
+        && bare_first_token.len() > 1
+        && bare_first_token[1..]
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_');
+    let looks_like_bare_skill = !bare_first_token.is_empty()
         && !bare_first_token.starts_with('/')
+        && !bare_first_token.starts_with('$')
         && bare_first_token
             .chars()
             .all(|c| c.is_alphanumeric() || c == '-' || c == '_');
-    if !looks_like_skill_name {
+    if !(looks_like_explicit_skill || looks_like_bare_skill) {
         return None;
     }
     match resolve_skill_invocation(cwd, Some(trimmed)) {
@@ -805,6 +812,26 @@ fn join_optional_args(args: &[String]) -> Option<String> {
     let joined = args.join(" ");
     let trimmed = joined.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn repl_completion_candidates_with_skills(
+    model: &str,
+    active_session_id: Option<&str>,
+    recent_session_ids: Vec<String>,
+    cwd: &Path,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut completions = slash_command_completion_candidates_with_sessions(
+        model,
+        active_session_id,
+        recent_session_ids,
+    );
+    completions.extend(skill_completion_candidates(cwd)?);
+    let completions = completions
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    Ok(completions)
 }
 
 #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
@@ -3121,11 +3148,11 @@ fn run_repl(
                         continue;
                     }
                 }
-                // Bare-word skill dispatch: if the first token of the input
-                // matches a known skill name, invoke it as `/skills <input>`
-                // rather than forwarding raw text to the LLM (ROADMAP #36).
+                // Skill dispatch: if the first token of the input matches a
+                // known skill name (bare or `$skill` form), invoke it as a
+                // skill prompt rather than forwarding raw text to the LLM.
                 let cwd = std::env::current_dir().unwrap_or_default();
-                if let Some(prompt) = try_resolve_bare_skill_prompt(&cwd, &trimmed) {
+                if let Some(prompt) = try_resolve_skill_prompt(&cwd, &trimmed) {
                     editor.push_history(input);
                     cli.record_prompt_history(&trimmed);
                     cli.run_turn(&prompt)?;
@@ -3736,14 +3763,16 @@ impl LiveCli {
     }
 
     fn repl_completion_candidates(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        Ok(slash_command_completion_candidates_with_sessions(
+        let cwd = env::current_dir()?;
+        repl_completion_candidates_with_skills(
             &self.model,
             Some(&self.session.id),
             list_managed_sessions()?
                 .into_iter()
                 .map(|session| session.id)
                 .collect(),
-        ))
+            &cwd,
+        )
     }
 
     fn prepare_turn_runtime(
@@ -4900,7 +4929,7 @@ fn render_repl_help() -> String {
         "  /quit                Quit the REPL".to_string(),
         "  Up/Down              Navigate prompt history".to_string(),
         "  Ctrl-R               Reverse-search prompt history".to_string(),
-        "  Tab                  Complete commands, modes, and recent sessions".to_string(),
+        "  Tab                  Complete commands, skills, modes, and recent sessions".to_string(),
         "  Ctrl-C               Clear input (or exit on empty prompt)".to_string(),
         "  Shift+Enter/Ctrl+J   Insert a newline".to_string(),
         "  Auto-save            .claw/sessions/<session-id>.jsonl".to_string(),
@@ -8382,11 +8411,11 @@ mod tests {
         render_config_report, render_diff_report, render_diff_report_for, render_memory_report,
         render_prompt_history_report, render_repl_help, render_resume_usage,
         render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
-        resolve_repl_model, resolve_session_reference, response_to_events,
+        repl_completion_candidates_with_skills, resolve_repl_model, resolve_session_reference, response_to_events,
         should_keep_repl_alive_after_turn_error,
         resume_supported_slash_commands, run_resume_command, short_tool_id,
         slash_command_completion_candidates_with_sessions, status_context,
-        summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt, validate_no_args,
+        summarize_tool_payload_for_markdown, try_resolve_skill_prompt, validate_no_args,
         write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
         PromptHistoryEntry, SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
@@ -10002,7 +10031,7 @@ mod tests {
             "Project skill fixture",
         );
 
-        let prompt = try_resolve_bare_skill_prompt(&workspace, "caveman sharpen club")
+        let prompt = try_resolve_skill_prompt(&workspace, "caveman sharpen club")
             .expect("known bare skill should dispatch");
         assert_eq!(prompt, "$caveman sharpen club");
 
@@ -10016,10 +10045,27 @@ mod tests {
         fs::create_dir_all(&workspace).expect("workspace should exist");
 
         assert_eq!(
-            try_resolve_bare_skill_prompt(&workspace, "not-a-known-skill do thing"),
+            try_resolve_skill_prompt(&workspace, "not-a-known-skill do thing"),
             None
         );
-        assert_eq!(try_resolve_bare_skill_prompt(&workspace, "/status"), None);
+        assert_eq!(try_resolve_skill_prompt(&workspace, "/status"), None);
+
+        fs::remove_dir_all(workspace).expect("workspace should clean up");
+    }
+
+    #[test]
+    fn explicit_dollar_skill_dispatch_resolves_known_skill_to_prompt() {
+        let _guard = env_lock();
+        let workspace = temp_dir();
+        write_skill_fixture(
+            &workspace.join(".codex").join("skills"),
+            "brainstorming",
+            "Project skill fixture",
+        );
+
+        let prompt = try_resolve_skill_prompt(&workspace, "$brainstorming scope it")
+            .expect("known explicit skill should dispatch");
+        assert_eq!(prompt, "$brainstorming scope it");
 
         fs::remove_dir_all(workspace).expect("workspace should clean up");
     }
@@ -10029,7 +10075,7 @@ mod tests {
         let help = render_repl_help();
         assert!(help.contains("REPL"));
         assert!(help.contains("/help"));
-        assert!(help.contains("Complete commands, modes, and recent sessions"));
+        assert!(help.contains("Complete commands, skills, modes, and recent sessions"));
         assert!(help.contains("/status"));
         assert!(help.contains("/sandbox"));
         assert!(help.contains("/model [model]"));
@@ -10073,6 +10119,27 @@ mod tests {
         assert!(completions.contains(&"/resume session-old".to_string()));
         assert!(completions.contains(&"/mcp list".to_string()));
         assert!(completions.contains(&"/ultraplan ".to_string()));
+    }
+
+    #[test]
+    fn repl_completion_candidates_include_skills() {
+        let _guard = env_lock();
+        let workspace = temp_dir();
+        write_skill_fixture(
+            &workspace.join(".codex").join("skills"),
+            "brainstorming",
+            "Project skill fixture",
+        );
+
+        let completions = with_current_dir(&workspace, || {
+            repl_completion_candidates_with_skills("sonnet", None, Vec::new(), &workspace)
+                .expect("repl completions should load")
+        });
+
+        assert!(completions.contains(&"/help".to_string()));
+        assert!(completions.contains(&"$brainstorming".to_string()));
+
+        fs::remove_dir_all(workspace).expect("workspace should clean up");
     }
 
     #[test]

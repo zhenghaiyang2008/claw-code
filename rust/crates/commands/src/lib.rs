@@ -1,6 +1,6 @@
 mod omc_commands;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt;
 use std::fs;
@@ -2064,7 +2064,7 @@ pub fn render_slash_command_help() -> String {
 
     lines.push("Keyboard shortcuts".to_string());
     lines.push("  Up/Down              Navigate prompt history".to_string());
-    lines.push("  Tab                  Complete commands, modes, and recent sessions".to_string());
+    lines.push("  Tab                  Complete commands, skills, modes, and recent sessions".to_string());
     lines.push("  Ctrl-C               Clear input (or exit on empty prompt)".to_string());
     lines.push("  Shift+Enter/Ctrl+J   Insert a newline".to_string());
 
@@ -2436,8 +2436,21 @@ pub fn classify_skills_slash_command(args: Option<&str>) -> SkillSlashDispatch {
         Some(args) if args == "install" || args.starts_with("install ") => {
             SkillSlashDispatch::Local
         }
-        Some(args) => SkillSlashDispatch::Invoke(format!("${}", args.trim_start_matches('/'))),
+        Some(args) => SkillSlashDispatch::Invoke(format!(
+            "${}",
+            args.trim_start_matches('/').trim_start_matches('$')
+        )),
     }
+}
+
+pub fn skill_completion_candidates(cwd: &Path) -> std::io::Result<Vec<String>> {
+    let roots = discover_skill_roots(cwd);
+    let skills = load_skills_from_roots(&roots)?;
+    let mut completions = BTreeSet::new();
+    for skill in skills.iter().filter(|skill| skill.shadowed_by.is_none()) {
+        completions.insert(format!("${}", skill.name));
+    }
+    Ok(completions.into_iter().collect())
 }
 
 /// Resolve a skill invocation by validating the skill exists on disk before
@@ -4730,7 +4743,7 @@ mod tests {
 
         assert!(help.contains("Keyboard shortcuts"));
         assert!(help.contains("Up/Down              Navigate prompt history"));
-        assert!(help.contains("Tab                  Complete commands, modes, and recent sessions"));
+        assert!(help.contains("Tab                  Complete commands, skills, modes, and recent sessions"));
         assert!(help.contains("Ctrl-C               Clear input (or exit on empty prompt)"));
         assert!(help.contains("Shift+Enter/Ctrl+J   Insert a newline"));
 
@@ -5437,6 +5450,33 @@ mod tests {
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(user_home);
         let _ = fs::remove_dir_all(claude_config_dir);
+    }
+
+    #[test]
+    fn skill_completion_candidates_return_active_prefixed_skills() {
+        let _guard = env_guard();
+        let workspace = temp_dir("skills-completion-workspace");
+        let user_home = temp_dir("skills-completion-home");
+        let project_skills = workspace.join(".codex").join("skills");
+        let user_skills = user_home.join(".codex").join("skills");
+        let original_home = std::env::var_os("HOME");
+
+        write_skill(&project_skills, "brainstorming", "Project override");
+        write_skill(&user_skills, "brainstorming", "User shadowed");
+        write_skill(&user_skills, "deep-interview", "User active");
+        std::env::set_var("HOME", &user_home);
+
+        let completions =
+            super::skill_completion_candidates(&workspace).expect("skill completions should load");
+
+        assert_eq!(
+            completions,
+            vec!["$brainstorming".to_string(), "$deep-interview".to_string()]
+        );
+
+        restore_env_var("HOME", original_home);
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(user_home);
     }
 
     #[test]
