@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::json::JsonValue;
 use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
+use serde_json::Value as SerdeJsonValue;
 
 /// Schema name advertised by generated settings files.
 pub const CLAW_SETTINGS_SCHEMA_NAME: &str = "SettingsSchema";
@@ -247,10 +248,17 @@ impl ConfigLoader {
             || PathBuf::from(".claw.json"),
             |parent| parent.join(".claw.json"),
         );
+        let claude_legacy_path = self.config_home.parent().map_or_else(
+            || PathBuf::from(".claude.json"),
+            |parent| parent.join(".claude.json"),
+        );
         let claude_home_settings = self
             .config_home
             .parent()
             .map(|parent| parent.join(".claude").join("settings.json"));
+        let claude_env_legacy = std::env::var("CLAUDE_CONFIG_DIR")
+            .ok()
+            .and_then(|dir| PathBuf::from(dir).parent().map(|parent| parent.join(".claude.json")));
         let claude_env_settings = std::env::var("CLAUDE_CONFIG_DIR")
             .ok()
             .map(|dir| PathBuf::from(dir).join("settings.json"));
@@ -264,7 +272,17 @@ impl ConfigLoader {
                 path: self.config_home.join("settings.json"),
             },
         ];
+        entries.push(ConfigEntry {
+            source: ConfigSource::User,
+            path: claude_legacy_path,
+        });
         if let Some(path) = claude_home_settings {
+            entries.push(ConfigEntry {
+                source: ConfigSource::User,
+                path,
+            });
+        }
+        if let Some(path) = claude_env_legacy {
             entries.push(ConfigEntry {
                 source: ConfigSource::User,
                 path,
@@ -732,6 +750,8 @@ struct ParsedConfigFile {
 
 fn read_optional_json_object(path: &Path) -> Result<Option<ParsedConfigFile>, ConfigError> {
     let is_legacy_config = path.file_name().and_then(|name| name.to_str()) == Some(".claw.json");
+    let is_claude_legacy_config =
+        path.file_name().and_then(|name| name.to_str()) == Some(".claude.json");
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -748,6 +768,13 @@ fn read_optional_json_object(path: &Path) -> Result<Option<ParsedConfigFile>, Co
     let parsed = match JsonValue::parse(&contents) {
         Ok(parsed) => parsed,
         Err(_error) if is_legacy_config => return Ok(None),
+        Err(_error) if is_claude_legacy_config => {
+            let parsed = parse_supported_claude_legacy_json(&contents, path)?;
+            return Ok(Some(ParsedConfigFile {
+                object: parsed,
+                source: contents,
+            }));
+        }
         Err(error) => return Err(ConfigError::Parse(format!("{}: {error}", path.display()))),
     };
     let Some(object) = parsed.as_object() else {
@@ -763,6 +790,67 @@ fn read_optional_json_object(path: &Path) -> Result<Option<ParsedConfigFile>, Co
         object: object.clone(),
         source: contents,
     }))
+}
+
+fn parse_supported_claude_legacy_json(
+    contents: &str,
+    path: &Path,
+) -> Result<BTreeMap<String, JsonValue>, ConfigError> {
+    let parsed: SerdeJsonValue = serde_json::from_str(contents)
+        .map_err(|error| ConfigError::Parse(format!("{}: {error}", path.display())))?;
+    let object = parsed.as_object().ok_or_else(|| {
+        ConfigError::Parse(format!(
+            "{}: top-level settings value must be a JSON object",
+            path.display()
+        ))
+    })?;
+
+    const SUPPORTED_KEYS: &[&str] = &[
+        "$schema",
+        "model",
+        "hooks",
+        "permissions",
+        "permissionMode",
+        "mcpServers",
+        "oauth",
+        "enabledPlugins",
+        "plugins",
+        "sandbox",
+        "env",
+        "aliases",
+        "providerFallbacks",
+        "trustedRoots",
+        "includeCoAuthoredBy",
+    ];
+
+    let mut filtered = BTreeMap::new();
+    for key in SUPPORTED_KEYS {
+        if let Some(value) = object.get(*key) {
+            if let Some(converted) = convert_supported_json_value(value) {
+                filtered.insert((*key).to_string(), converted);
+            }
+        }
+    }
+    Ok(filtered)
+}
+
+fn convert_supported_json_value(value: &SerdeJsonValue) -> Option<JsonValue> {
+    match value {
+        SerdeJsonValue::Null => Some(JsonValue::Null),
+        SerdeJsonValue::Bool(value) => Some(JsonValue::Bool(*value)),
+        SerdeJsonValue::Number(number) => number.as_i64().map(JsonValue::Number),
+        SerdeJsonValue::String(value) => Some(JsonValue::String(value.clone())),
+        SerdeJsonValue::Array(values) => values
+            .iter()
+            .map(convert_supported_json_value)
+            .collect::<Option<Vec<_>>>()
+            .map(JsonValue::Array),
+        SerdeJsonValue::Object(object) => object
+            .iter()
+            .map(|(key, value)| convert_supported_json_value(value).map(|value| (key.clone(), value)))
+            .collect::<Option<BTreeMap<_, _>>>()
+            .map(JsonValue::Object),
+    }
 }
 
 fn merge_mcp_servers(
@@ -1314,6 +1402,7 @@ mod tests {
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
     use std::fs;
+    use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir() -> std::path::PathBuf {
@@ -1500,6 +1589,40 @@ mod tests {
 
         assert!(loaded.mcp().get("claude-home").is_some());
         assert!(loaded.mcp().get("project-local").is_some());
+
+        restore_env_var("HOME", original_home);
+        restore_env_var("CLAUDE_CONFIG_DIR", original_claude_config_dir);
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn loads_and_merges_claude_legacy_json_mcp_servers() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+
+        let original_home = std::env::var_os("HOME");
+        let original_claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
+        std::env::set_var("HOME", root.join("home"));
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+        fs::write(
+            root.join("home").join(".claude.json"),
+            r#"{"mcpServers":{"claude-legacy":{"command":"uvx","args":["claude-legacy"]}}}"#,
+        )
+        .expect("write claude legacy config");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        assert!(loaded.mcp().get("claude-legacy").is_some());
+        assert!(loaded
+            .loaded_entries()
+            .iter()
+            .any(|entry| entry.path.ends_with(Path::new(".claude.json"))));
 
         restore_env_var("HOME", original_home);
         restore_env_var("CLAUDE_CONFIG_DIR", original_claude_config_dir);
