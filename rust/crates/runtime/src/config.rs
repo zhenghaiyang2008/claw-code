@@ -82,6 +82,9 @@ pub struct RuntimeHookConfig {
     pre_tool_use: Vec<String>,
     post_tool_use: Vec<String>,
     post_tool_use_failure: Vec<String>,
+    user_prompt_submit: Vec<String>,
+    session_start: Vec<String>,
+    stop: Vec<String>,
 }
 
 /// Raw permission rule lists grouped by allow, deny, and ask behavior.
@@ -575,7 +578,23 @@ impl RuntimeHookConfig {
             pre_tool_use,
             post_tool_use,
             post_tool_use_failure,
+            user_prompt_submit: Vec::new(),
+            session_start: Vec::new(),
+            stop: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_lifecycle_hooks(
+        mut self,
+        user_prompt_submit: Vec<String>,
+        session_start: Vec<String>,
+        stop: Vec<String>,
+    ) -> Self {
+        self.user_prompt_submit = user_prompt_submit;
+        self.session_start = session_start;
+        self.stop = stop;
+        self
     }
 
     #[must_use]
@@ -602,11 +621,29 @@ impl RuntimeHookConfig {
             &mut self.post_tool_use_failure,
             other.post_tool_use_failure(),
         );
+        extend_unique(&mut self.user_prompt_submit, other.user_prompt_submit());
+        extend_unique(&mut self.session_start, other.session_start());
+        extend_unique(&mut self.stop, other.stop());
     }
 
     #[must_use]
     pub fn post_tool_use_failure(&self) -> &[String] {
         &self.post_tool_use_failure
+    }
+
+    #[must_use]
+    pub fn user_prompt_submit(&self) -> &[String] {
+        &self.user_prompt_submit
+    }
+
+    #[must_use]
+    pub fn session_start(&self) -> &[String] {
+        &self.session_start
+    }
+
+    #[must_use]
+    pub fn stop(&self) -> &[String] {
+        &self.stop
     }
 }
 
@@ -767,6 +804,10 @@ fn parse_optional_hooks_config_object(
         post_tool_use: optional_string_array(hooks, "PostToolUse", context)?.unwrap_or_default(),
         post_tool_use_failure: optional_string_array(hooks, "PostToolUseFailure", context)?
             .unwrap_or_default(),
+        user_prompt_submit: optional_string_array(hooks, "UserPromptSubmit", context)?
+            .unwrap_or_default(),
+        session_start: optional_string_array(hooks, "SessionStart", context)?.unwrap_or_default(),
+        stop: optional_string_array(hooks, "Stop", context)?.unwrap_or_default(),
     })
 }
 
@@ -1297,7 +1338,7 @@ mod tests {
         .expect("write user compat config");
         fs::write(
             home.join("settings.json"),
-            r#"{"model":"sonnet","env":{"A2":"1"},"hooks":{"PreToolUse":["base"]},"permissions":{"defaultMode":"plan","allow":["Read"],"deny":["Bash(rm -rf)"]}}"#,
+            r#"{"model":"sonnet","env":{"A2":"1"},"hooks":{"PreToolUse":["base"],"SessionStart":["base-session"]},"permissions":{"defaultMode":"plan","allow":["Read"],"deny":["Bash(rm -rf)"]}}"#,
         )
         .expect("write user settings");
         fs::write(
@@ -1307,7 +1348,7 @@ mod tests {
         .expect("write project compat config");
         fs::write(
             cwd.join(".claw").join("settings.json"),
-            r#"{"env":{"C":"3"},"hooks":{"PostToolUse":["project"],"PostToolUseFailure":["project-failure"]},"permissions":{"ask":["Edit"]},"mcpServers":{"project":{"command":"uvx","args":["project"]}}}"#,
+            r#"{"env":{"C":"3"},"hooks":{"PostToolUse":["project"],"PostToolUseFailure":["project-failure"],"UserPromptSubmit":["project-prompt"],"Stop":["project-stop"]},"permissions":{"ask":["Edit"]},"mcpServers":{"project":{"command":"uvx","args":["project"]}}}"#,
         )
         .expect("write project settings");
         fs::write(
@@ -1356,6 +1397,15 @@ mod tests {
             loaded.hooks().post_tool_use_failure(),
             &["project-failure".to_string()]
         );
+        assert_eq!(
+            loaded.hooks().user_prompt_submit(),
+            &["project-prompt".to_string()]
+        );
+        assert_eq!(
+            loaded.hooks().session_start(),
+            &["base-session".to_string()]
+        );
+        assert_eq!(loaded.hooks().stop(), &["project-stop".to_string()]);
         assert_eq!(loaded.permission_rules().allow(), &["Read".to_string()]);
         assert_eq!(
             loaded.permission_rules().deny(),
@@ -1919,11 +1969,21 @@ mod tests {
             vec!["pre-a".to_string()],
             vec!["post-a".to_string()],
             vec!["failure-a".to_string()],
+        )
+        .with_lifecycle_hooks(
+            vec!["prompt-a".to_string()],
+            vec!["session-a".to_string()],
+            vec!["stop-a".to_string()],
         );
         let overlay = RuntimeHookConfig::new(
             vec!["pre-a".to_string(), "pre-b".to_string()],
             vec!["post-a".to_string(), "post-b".to_string()],
             vec!["failure-b".to_string()],
+        )
+        .with_lifecycle_hooks(
+            vec!["prompt-a".to_string(), "prompt-b".to_string()],
+            vec!["session-b".to_string()],
+            vec!["stop-b".to_string()],
         );
 
         // when
@@ -1941,6 +2001,18 @@ mod tests {
         assert_eq!(
             merged.post_tool_use_failure(),
             &["failure-a".to_string(), "failure-b".to_string()]
+        );
+        assert_eq!(
+            merged.user_prompt_submit(),
+            &["prompt-a".to_string(), "prompt-b".to_string()]
+        );
+        assert_eq!(
+            merged.session_start(),
+            &["session-a".to_string(), "session-b".to_string()]
+        );
+        assert_eq!(
+            merged.stop(),
+            &["stop-a".to_string(), "stop-b".to_string()]
         );
     }
 

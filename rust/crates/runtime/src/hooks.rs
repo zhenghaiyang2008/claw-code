@@ -12,6 +12,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
+use crate::omc_lifecycle::{OmcLifecycleEvent, OmcLifecyclePayload};
 use crate::permissions::PermissionOverride;
 
 const HOOK_PREVIEW_CHAR_LIMIT: usize = 160;
@@ -23,6 +24,9 @@ pub enum HookEvent {
     PreToolUse,
     PostToolUse,
     PostToolUseFailure,
+    UserPromptSubmit,
+    SessionStart,
+    Stop,
 }
 
 impl HookEvent {
@@ -32,6 +36,9 @@ impl HookEvent {
             Self::PreToolUse => "PreToolUse",
             Self::PostToolUse => "PostToolUse",
             Self::PostToolUseFailure => "PostToolUseFailure",
+            Self::UserPromptSubmit => "UserPromptSubmit",
+            Self::SessionStart => "SessionStart",
+            Self::Stop => "Stop",
         }
     }
 }
@@ -309,6 +316,44 @@ impl HookRunner {
         )
     }
 
+    #[must_use]
+    pub fn run_omc_lifecycle_event(&self, payload: &OmcLifecyclePayload) -> HookRunResult {
+        self.run_omc_lifecycle_event_with_context(payload, None, None)
+    }
+
+    #[must_use]
+    pub fn run_omc_lifecycle_event_with_context(
+        &self,
+        payload: &OmcLifecyclePayload,
+        abort_signal: Option<&HookAbortSignal>,
+        reporter: Option<&mut dyn HookProgressReporter>,
+    ) -> HookRunResult {
+        let event = match payload.event {
+            OmcLifecycleEvent::UserPromptSubmit => HookEvent::UserPromptSubmit,
+            OmcLifecycleEvent::SessionStart => HookEvent::SessionStart,
+            OmcLifecycleEvent::Stop => HookEvent::Stop,
+        };
+
+        Self::run_lifecycle_commands(
+            event,
+            self.commands_for_event(event),
+            payload,
+            abort_signal,
+            reporter,
+        )
+    }
+
+    fn commands_for_event(&self, event: HookEvent) -> &[String] {
+        match event {
+            HookEvent::PreToolUse => self.config.pre_tool_use(),
+            HookEvent::PostToolUse => self.config.post_tool_use(),
+            HookEvent::PostToolUseFailure => self.config.post_tool_use_failure(),
+            HookEvent::UserPromptSubmit => self.config.user_prompt_submit(),
+            HookEvent::SessionStart => self.config.session_start(),
+            HookEvent::Stop => self.config.stop(),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_commands(
         event: HookEvent,
@@ -413,6 +458,94 @@ impl HookRunner {
         result
     }
 
+    fn run_lifecycle_commands(
+        event: HookEvent,
+        commands: &[String],
+        payload: &OmcLifecyclePayload,
+        abort_signal: Option<&HookAbortSignal>,
+        mut reporter: Option<&mut dyn HookProgressReporter>,
+    ) -> HookRunResult {
+        if commands.is_empty() {
+            return HookRunResult::allow(Vec::new());
+        }
+
+        if abort_signal.is_some_and(HookAbortSignal::is_aborted) {
+            return HookRunResult::allow(vec![format!(
+                "{} hook cancelled before execution",
+                event.as_str()
+            )]);
+        }
+
+        let payload_json = payload.hook_payload().to_string();
+        let subject_name = event.as_str().to_string();
+        let env_pairs = payload.hook_env_pairs();
+        let env_pairs = env_pairs.as_slice();
+        let mut result = HookRunResult::allow(Vec::new());
+
+        for command in commands {
+            if let Some(reporter) = reporter.as_deref_mut() {
+                reporter.on_event(&HookProgressEvent::Started {
+                    event,
+                    tool_name: subject_name.clone(),
+                    command: command.clone(),
+                });
+            }
+
+            match Self::run_lifecycle_command(
+                command,
+                event,
+                &subject_name,
+                &payload_json,
+                env_pairs,
+                abort_signal,
+            ) {
+                HookCommandOutcome::Allow { parsed } => {
+                    if let Some(reporter) = reporter.as_deref_mut() {
+                        reporter.on_event(&HookProgressEvent::Completed {
+                            event,
+                            tool_name: subject_name.clone(),
+                            command: command.clone(),
+                        });
+                    }
+                    merge_lifecycle_hook_output(&mut result, parsed);
+                }
+                HookCommandOutcome::Deny { parsed } => {
+                    if let Some(reporter) = reporter.as_deref_mut() {
+                        reporter.on_event(&HookProgressEvent::Completed {
+                            event,
+                            tool_name: subject_name.clone(),
+                            command: command.clone(),
+                        });
+                    }
+                    merge_lifecycle_hook_output(&mut result, parsed);
+                }
+                HookCommandOutcome::Failed { parsed } => {
+                    if let Some(reporter) = reporter.as_deref_mut() {
+                        reporter.on_event(&HookProgressEvent::Completed {
+                            event,
+                            tool_name: subject_name.clone(),
+                            command: command.clone(),
+                        });
+                    }
+                    merge_lifecycle_hook_output(&mut result, parsed);
+                }
+                HookCommandOutcome::Cancelled { message } => {
+                    if let Some(reporter) = reporter.as_deref_mut() {
+                        reporter.on_event(&HookProgressEvent::Cancelled {
+                            event,
+                            tool_name: subject_name.clone(),
+                            command: command.clone(),
+                        });
+                    }
+                    result.messages.push(message);
+                    break;
+                }
+            }
+        }
+
+        result
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_command(
         command: &str,
@@ -491,6 +624,77 @@ impl HookRunner {
             },
         }
     }
+
+    fn run_lifecycle_command(
+        command: &str,
+        event: HookEvent,
+        subject_name: &str,
+        payload: &str,
+        env_pairs: &[(&'static str, String)],
+        abort_signal: Option<&HookAbortSignal>,
+    ) -> HookCommandOutcome {
+        let mut child = shell_command(command);
+        child.stdin(Stdio::piped());
+        child.stdout(Stdio::piped());
+        child.stderr(Stdio::piped());
+        child.env("HOOK_EVENT", event.as_str());
+        for (key, value) in env_pairs {
+            child.env(key, value);
+        }
+
+        match child.output_with_stdin(payload.as_bytes(), abort_signal) {
+            Ok(CommandExecution::Finished(output)) => {
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                let parsed = parse_hook_output(event, subject_name, command, &stdout, &stderr);
+                let primary_message = parsed.primary_message().map(ToOwned::to_owned);
+                match output.status.code() {
+                    Some(0) => {
+                        if parsed.deny {
+                            HookCommandOutcome::Deny { parsed }
+                        } else {
+                            HookCommandOutcome::Allow { parsed }
+                        }
+                    }
+                    Some(2) => HookCommandOutcome::Deny {
+                        parsed: parsed.with_fallback_message(format!(
+                            "{} hook denied `{subject_name}`",
+                            event.as_str()
+                        )),
+                    },
+                    Some(code) => HookCommandOutcome::Failed {
+                        parsed: parsed.with_fallback_message(format_hook_failure(
+                            command,
+                            code,
+                            primary_message.as_deref(),
+                            stderr.as_str(),
+                        )),
+                    },
+                    None => HookCommandOutcome::Failed {
+                        parsed: parsed.with_fallback_message(format!(
+                            "{} hook `{command}` terminated by signal while handling `{subject_name}`",
+                            event.as_str()
+                        )),
+                    },
+                }
+            }
+            Ok(CommandExecution::Cancelled) => HookCommandOutcome::Cancelled {
+                message: format!(
+                    "{} hook `{command}` cancelled while handling `{subject_name}`",
+                    event.as_str()
+                ),
+            },
+            Err(error) => HookCommandOutcome::Failed {
+                parsed: ParsedHookOutput {
+                    messages: vec![format!(
+                        "{} hook `{command}` failed to start for `{subject_name}`: {error}",
+                        event.as_str()
+                    )],
+                    ..ParsedHookOutput::default()
+                },
+            },
+        }
+    }
 }
 
 enum HookCommandOutcome {
@@ -533,6 +737,10 @@ fn merge_parsed_hook_output(target: &mut HookRunResult, parsed: ParsedHookOutput
     if parsed.updated_input.is_some() {
         target.updated_input = parsed.updated_input;
     }
+}
+
+fn merge_lifecycle_hook_output(target: &mut HookRunResult, parsed: ParsedHookOutput) {
+    target.messages.extend(parsed.messages);
 }
 
 fn parse_hook_output(
@@ -826,6 +1034,7 @@ mod tests {
         HookRunner,
     };
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
+    use crate::omc_lifecycle::{OmcLifecycleEvent, OmcLifecyclePayload};
     use crate::permissions::PermissionOverride;
 
     struct RecordingReporter {
@@ -924,6 +1133,149 @@ mod tests {
         // then
         assert!(!result.is_denied());
         assert_eq!(result.messages(), &["failure hook ran".to_string()]);
+    }
+
+    #[test]
+    fn runs_session_start_lifecycle_hooks() {
+        let runner = HookRunner::new(
+            RuntimeHookConfig::new(Vec::new(), Vec::new(), Vec::new()).with_lifecycle_hooks(
+                Vec::new(),
+                vec![shell_snippet(
+                    r#"printf '%s' "{\"systemMessage\":\"$HOOK_EVENT|$HOOK_SESSION_ID|$HOOK_MODE\"}""#,
+                )],
+                Vec::new(),
+            ),
+        );
+
+        let result = runner.run_omc_lifecycle_event(&OmcLifecyclePayload::new(
+            OmcLifecycleEvent::SessionStart,
+            Some(" session-42 "),
+            Some(" deep_interview "),
+            None,
+        ));
+
+        assert_eq!(
+            result,
+            HookRunResult::allow(vec!["SessionStart|session-42|deep-interview".to_string()])
+        );
+    }
+
+    #[test]
+    fn runs_user_prompt_submit_lifecycle_hooks_with_payload_context() {
+        let runner = HookRunner::new(
+            RuntimeHookConfig::new(Vec::new(), Vec::new(), Vec::new()).with_lifecycle_hooks(
+                vec![shell_snippet(
+                    r#"printf '%s' "{\"systemMessage\":\"$HOOK_MESSAGE\",\"hookSpecificOutput\":{\"additionalContext\":\"$HOOK_SESSION_ID|$HOOK_MODE\"}}""#,
+                )],
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+
+        let result = runner.run_omc_lifecycle_event(&OmcLifecyclePayload::new(
+            OmcLifecycleEvent::UserPromptSubmit,
+            Some(" session-7 "),
+            Some(" swarm "),
+            Some("  hello lifecycle  "),
+        ));
+
+        assert_eq!(
+            result,
+            HookRunResult::allow(vec![
+                "hello lifecycle".to_string(),
+                "session-7|team".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn runs_stop_lifecycle_hooks() {
+        let runner = HookRunner::new(
+            RuntimeHookConfig::new(Vec::new(), Vec::new(), Vec::new()).with_lifecycle_hooks(
+                Vec::new(),
+                Vec::new(),
+                vec![shell_snippet(r#"printf '%s' "$HOOK_EVENT stop hook""#)],
+            ),
+        );
+
+        let result = runner.run_omc_lifecycle_event(&OmcLifecyclePayload::new(
+            OmcLifecycleEvent::Stop,
+            Some(" session-stop "),
+            Some(" verification "),
+            Some("  halted  "),
+        ));
+
+        assert_eq!(
+            result,
+            HookRunResult::allow(vec!["Stop stop hook".to_string()])
+        );
+    }
+
+    #[test]
+    fn lifecycle_hooks_treat_deny_and_failure_as_notifications() {
+        let runner = HookRunner::new(
+            RuntimeHookConfig::new(Vec::new(), Vec::new(), Vec::new()).with_lifecycle_hooks(
+                vec![
+                    shell_snippet(
+                        r#"printf '%s' "{\"reason\":\"blocked\",\"hookSpecificOutput\":{\"additionalContext\":\"context\",\"permissionDecision\":\"deny\",\"updatedInput\":{\"ignored\":true}}}"; exit 2"#,
+                    ),
+                    shell_snippet("printf 'broken notification'; exit 1"),
+                    shell_snippet("printf 'later notification'"),
+                ],
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+
+        let result = runner.run_omc_lifecycle_event(&OmcLifecyclePayload::new(
+            OmcLifecycleEvent::UserPromptSubmit,
+            Some("session-42"),
+            None,
+            Some("hello"),
+        ));
+
+        assert_eq!(
+            result,
+            HookRunResult::allow(vec![
+                "blocked".to_string(),
+                "context".to_string(),
+                "broken notification".to_string(),
+                "later notification".to_string(),
+            ])
+        );
+        assert_eq!(result.permission_override(), None);
+        assert_eq!(result.permission_reason(), None);
+        assert_eq!(result.updated_input(), None);
+    }
+
+    #[test]
+    fn lifecycle_hook_cancellation_is_notification_only() {
+        let runner = HookRunner::new(
+            RuntimeHookConfig::new(Vec::new(), Vec::new(), Vec::new()).with_lifecycle_hooks(
+                Vec::new(),
+                vec![shell_snippet("sleep 1")],
+                Vec::new(),
+            ),
+        );
+        let abort_signal = HookAbortSignal::new();
+        abort_signal.abort();
+
+        let result = runner.run_omc_lifecycle_event_with_context(
+            &OmcLifecyclePayload::new(
+                OmcLifecycleEvent::SessionStart,
+                Some("session-7"),
+                None,
+                None,
+            ),
+            Some(&abort_signal),
+            None,
+        );
+
+        assert_eq!(
+            result,
+            HookRunResult::allow(vec!["SessionStart hook cancelled before execution".to_string()])
+        );
+        assert!(!result.is_cancelled());
     }
 
     #[test]

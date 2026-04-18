@@ -212,6 +212,18 @@ const HOOKS_FIELDS: &[FieldSpec] = &[
         name: "PostToolUseFailure",
         expected: FieldType::StringArray,
     },
+    FieldSpec {
+        name: "UserPromptSubmit",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "SessionStart",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "Stop",
+        expected: FieldType::StringArray,
+    },
 ];
 
 const PERMISSIONS_FIELDS: &[FieldSpec] = &[
@@ -667,6 +679,20 @@ mod tests {
         // then
         assert_eq!(result.errors.len(), 1);
         assert_eq!(result.errors[0].field, "hooks.BadHook");
+    }
+
+    #[test]
+    fn accepts_omc_lifecycle_hook_keys() {
+        // given
+        let source = r#"{"hooks": {"UserPromptSubmit": ["prompt"], "SessionStart": ["start"], "Stop": ["stop"]}}"#;
+        let parsed = JsonValue::parse(source).expect("valid json");
+        let object = parsed.as_object().expect("object");
+
+        // when
+        let result = validate_config_file(object, source, &test_path());
+
+        // then
+        assert!(result.errors.is_empty(), "unexpected errors: {result:?}");
     }
 
     #[test]

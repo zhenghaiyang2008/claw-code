@@ -29,6 +29,7 @@ pub mod mcp_tool_bridge;
 pub mod mode_state;
 mod oauth;
 pub mod omc_compat;
+pub mod omc_lifecycle;
 pub mod permission_enforcer;
 mod permissions;
 pub mod plugin_lifecycle;
@@ -121,6 +122,9 @@ pub use mcp_stdio::{
 pub use mode_state::{ModeStateError, ModeStateRecord, ModeStateStore, ModeStateSummary};
 pub use omc_compat::{
     build_omc_handoff, normalize_mode_name, OmcCompatHandoff, OMC_COMPAT_SCHEMA_VERSION,
+};
+pub use omc_lifecycle::{
+    OmcLifecycleEvent, OmcLifecyclePayload, OmcLifecycleStateBridge,
 };
 pub use oauth::{
     clear_oauth_credentials, code_challenge_s256, credentials_path, generate_pkce_pair,
