@@ -247,7 +247,14 @@ impl ConfigLoader {
             || PathBuf::from(".claw.json"),
             |parent| parent.join(".claw.json"),
         );
-        vec![
+        let claude_home_settings = self
+            .config_home
+            .parent()
+            .map(|parent| parent.join(".claude").join("settings.json"));
+        let claude_env_settings = std::env::var("CLAUDE_CONFIG_DIR")
+            .ok()
+            .map(|dir| PathBuf::from(dir).join("settings.json"));
+        let mut entries = vec![
             ConfigEntry {
                 source: ConfigSource::User,
                 path: user_legacy_path,
@@ -256,6 +263,20 @@ impl ConfigLoader {
                 source: ConfigSource::User,
                 path: self.config_home.join("settings.json"),
             },
+        ];
+        if let Some(path) = claude_home_settings {
+            entries.push(ConfigEntry {
+                source: ConfigSource::User,
+                path,
+            });
+        }
+        if let Some(path) = claude_env_settings {
+            entries.push(ConfigEntry {
+                source: ConfigSource::User,
+                path,
+            });
+        }
+        entries.extend([
             ConfigEntry {
                 source: ConfigSource::Project,
                 path: self.cwd.join(".claw.json"),
@@ -268,7 +289,8 @@ impl ConfigLoader {
                 source: ConfigSource::Local,
                 path: self.cwd.join(".claw").join("settings.local.json"),
             },
-        ]
+        ]);
+        entries
     }
 
     pub fn load(&self) -> Result<RuntimeConfig, ConfigError> {
@@ -1302,6 +1324,14 @@ mod tests {
         std::env::temp_dir().join(format!("runtime-config-{nanos}"))
     }
 
+    fn restore_env_var(key: &str, original: Option<std::ffi::OsString>) {
+        if let Some(value) = original {
+            std::env::set_var(key, value);
+        } else {
+            std::env::remove_var(key);
+        }
+    }
+
     #[test]
     fn rejects_non_object_settings_files() {
         let root = temp_dir();
@@ -1328,8 +1358,15 @@ mod tests {
         let root = temp_dir();
         let cwd = root.join("project");
         let home = root.join("home").join(".claw");
+        let claude_home = root.join("home").join(".claude");
         fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
         fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&claude_home).expect("claude home config dir");
+
+        let original_home = std::env::var_os("HOME");
+        let original_claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
+        std::env::set_var("HOME", root.join("home"));
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
 
         fs::write(
             home.parent().expect("home parent").join(".claw.json"),
@@ -1341,6 +1378,11 @@ mod tests {
             r#"{"model":"sonnet","env":{"A2":"1"},"hooks":{"PreToolUse":["base"],"SessionStart":["base-session"]},"permissions":{"defaultMode":"plan","allow":["Read"],"deny":["Bash(rm -rf)"]}}"#,
         )
         .expect("write user settings");
+        fs::write(
+            claude_home.join("settings.json"),
+            r#"{"env":{"A3":"1"},"mcpServers":{"claude-home":{"command":"uvx","args":["claude-home"]}}}"#,
+        )
+        .expect("write claude settings");
         fs::write(
             cwd.join(".claw.json"),
             r#"{"model":"project-compat","env":{"B":"2"}}"#,
@@ -1362,8 +1404,13 @@ mod tests {
             .expect("config should load");
 
         assert_eq!(CLAW_SETTINGS_SCHEMA_NAME, "SettingsSchema");
-        assert_eq!(loaded.loaded_entries().len(), 5);
+        assert_eq!(loaded.loaded_entries().len(), 6);
         assert_eq!(loaded.loaded_entries()[0].source, ConfigSource::User);
+        assert_eq!(loaded.loaded_entries()[1].source, ConfigSource::User);
+        assert!(loaded
+            .loaded_entries()
+            .iter()
+            .any(|entry| entry.path.ends_with(std::path::Path::new(".claude/settings.json"))));
         assert_eq!(
             loaded.get("model"),
             Some(&JsonValue::String("opus".to_string()))
@@ -1379,7 +1426,7 @@ mod tests {
                 .and_then(JsonValue::as_object)
                 .expect("env object")
                 .len(),
-            4
+            5
         );
         assert!(loaded
             .get("hooks")
@@ -1413,8 +1460,49 @@ mod tests {
         );
         assert_eq!(loaded.permission_rules().ask(), &["Edit".to_string()]);
         assert!(loaded.mcp().get("home").is_some());
+        assert!(loaded.mcp().get("claude-home").is_some());
         assert!(loaded.mcp().get("project").is_some());
 
+        restore_env_var("HOME", original_home);
+        restore_env_var("CLAUDE_CONFIG_DIR", original_claude_config_dir);
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn loads_and_merges_claude_home_mcp_servers_by_precedence() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        let claude_home = root.join("home").join(".claude");
+        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&claude_home).expect("claude home config dir");
+
+        let original_home = std::env::var_os("HOME");
+        let original_claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
+        std::env::set_var("HOME", root.join("home"));
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+        fs::write(
+            claude_home.join("settings.json"),
+            r#"{"mcpServers":{"claude-home":{"command":"uvx","args":["claude-home"]}}}"#,
+        )
+        .expect("write claude home settings");
+        fs::write(
+            cwd.join(".claw").join("settings.local.json"),
+            r#"{"mcpServers":{"project-local":{"command":"uvx","args":["project-local"]}}}"#,
+        )
+        .expect("write project local settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        assert!(loaded.mcp().get("claude-home").is_some());
+        assert!(loaded.mcp().get("project-local").is_some());
+
+        restore_env_var("HOME", original_home);
+        restore_env_var("CLAUDE_CONFIG_DIR", original_claude_config_dir);
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
