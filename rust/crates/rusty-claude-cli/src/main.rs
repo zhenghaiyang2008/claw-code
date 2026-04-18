@@ -912,7 +912,7 @@ fn format_unknown_slash_command(name: &str) -> String {
 fn omc_compatibility_note_for_unknown_slash_command(name: &str) -> Option<&'static str> {
     name.starts_with("oh-my-claudecode:")
         .then_some(
-            "Compatibility note: `/oh-my-claudecode:*` is a Claude Code/OMC plugin command. `claw` does not yet load plugin slash commands, Claude statusline stdin, or OMC session hooks.",
+            "Compatibility note: `/oh-my-claudecode:*` is a Claude Code/OMC plugin command. `claw` now routes these namespaced commands through its built-in skill/command adapters when a matching target exists.",
         )
 }
 
@@ -9677,6 +9677,36 @@ mod tests {
     }
 
     #[test]
+    fn parses_omc_namespaced_slash_commands_through_existing_dispatch() {
+        assert_eq!(
+            parse_args(&[
+                "/oh-my-claudecode:deep-interview".to_string(),
+                "overview".to_string()
+            ])
+            .expect("OMC skill alias should parse"),
+            CliAction::Prompt {
+                prompt: "$deep-interview overview".to_string(),
+                model: DEFAULT_MODEL.to_string(),
+                output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+                permission_mode: crate::default_permission_mode(),
+                compact: false,
+                base_commit: None,
+                reasoning_effort: None,
+                allow_broad_cwd: false,
+            }
+        );
+        assert_eq!(
+            parse_args(&["/oh-my-claudecode:agents".to_string(), "list".to_string()])
+                .expect("OMC agents alias should parse"),
+            CliAction::Agents {
+                args: Some("list".to_string()),
+                output_format: CliOutputFormat::Text,
+            }
+        );
+    }
+
+    #[test]
     fn direct_slash_commands_surface_shared_validation_errors() {
         let compact_error = parse_args(&["/compact".to_string(), "now".to_string()])
             .expect_err("invalid /compact shape should be rejected");
@@ -9706,9 +9736,8 @@ mod tests {
         let report = format_unknown_slash_command_message("oh-my-claudecode:hud");
         assert!(report.contains("unknown slash command: /oh-my-claudecode:hud"));
         assert!(report.contains("Claude Code/OMC plugin command"));
-        assert!(report.contains("plugin slash commands"));
-        assert!(report.contains("statusline"));
-        assert!(report.contains("session hooks"));
+        assert!(report.contains("routes these namespaced commands"));
+        assert!(report.contains("skill/command adapters"));
     }
 
     #[test]
@@ -10660,11 +10689,11 @@ UU conflicted.rs",
     }
 
     #[test]
-    fn unknown_omc_slash_command_guidance_explains_runtime_gap() {
+    fn unknown_omc_slash_command_guidance_mentions_adapter_routing() {
         let message = format_unknown_slash_command("oh-my-claudecode:hud");
         assert!(message.contains("Unknown slash command: /oh-my-claudecode:hud"));
         assert!(message.contains("Claude Code/OMC plugin command"));
-        assert!(message.contains("does not yet load plugin slash commands"));
+        assert!(message.contains("routes these namespaced commands"));
     }
 
     #[test]

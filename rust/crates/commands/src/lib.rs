@@ -1,3 +1,5 @@
+mod omc_commands;
+
 use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
@@ -10,6 +12,8 @@ use runtime::{
     ScopedMcpServerConfig, Session,
 };
 use serde_json::{json, Value};
+
+pub use omc_commands::parse_omc_slash_command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandManifestEntry {
@@ -1293,6 +1297,15 @@ pub fn validate_slash_command_input(
     let trimmed = input.trim();
     if !trimmed.starts_with('/') {
         return Ok(None);
+    }
+
+    if let Some((command, args)) = parse_omc_slash_command(trimmed) {
+        let rewritten = if args.is_empty() {
+            format!("/{command}")
+        } else {
+            format!("/{command} {}", args.join(" "))
+        };
+        return validate_slash_command_input(&rewritten);
     }
 
     let mut parts = trimmed.trim_start_matches('/').split_whitespace();
@@ -4581,6 +4594,29 @@ mod tests {
         assert_eq!(
             classify_skills_slash_command(Some("install ./skill-pack")),
             SkillSlashDispatch::Local
+        );
+    }
+
+    #[test]
+    fn maps_omc_namespaced_commands_onto_existing_dispatch() {
+        assert_eq!(
+            SlashCommand::parse("/oh-my-claudecode:deep-interview overview"),
+            Ok(Some(SlashCommand::Skills {
+                args: Some("deep-interview overview".to_string()),
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/oh-my-claudecode:agents list"),
+            Ok(Some(SlashCommand::Agents {
+                args: Some("list".to_string()),
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/oh-my-claudecode:mcp show demo"),
+            Ok(Some(SlashCommand::Mcp {
+                action: Some("show".to_string()),
+                target: Some("demo".to_string()),
+            }))
         );
     }
 

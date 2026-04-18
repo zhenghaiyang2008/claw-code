@@ -105,26 +105,26 @@ fn slash_command_names_match_known_commands_and_suggest_nearby_unknown_ones() {
 }
 
 #[test]
-fn omc_namespaced_slash_commands_surface_a_targeted_compatibility_hint() {
+fn omc_namespaced_slash_commands_dispatch_through_local_command_aliases() {
     let temp_dir = unique_temp_dir("slash-dispatch-omc");
     fs::create_dir_all(&temp_dir).expect("temp dir should exist");
 
     let output = Command::new(env!("CARGO_BIN_EXE_claw"))
         .current_dir(&temp_dir)
-        .arg("/oh-my-claudecode:hud")
+        .arg("/oh-my-claudecode:agents")
+        .arg("list")
         .output()
         .expect("claw should launch");
 
     assert!(
-        !output.status.success(),
+        output.status.success(),
         "stdout:\n{}\n\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
-    assert!(stderr.contains("unknown slash command outside the REPL: /oh-my-claudecode:hud"));
-    assert!(stderr.contains("Claude Code/OMC plugin command"));
-    assert!(stderr.contains("does not yet load plugin slash commands"));
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    assert!(stdout.contains("Agents"));
+    assert!(stdout.contains("active agents"));
 
     fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
 }
