@@ -1099,6 +1099,37 @@ fn config_model_for_current_dir() -> Option<String> {
     loader.load().ok()?.model().map(ToOwned::to_owned)
 }
 
+fn claude_settings_env_value(key: &str) -> Option<String> {
+    let mut paths = Vec::new();
+    if let Ok(claude_config_dir) = env::var("CLAUDE_CONFIG_DIR") {
+        paths.push(PathBuf::from(claude_config_dir).join("settings.json"));
+    }
+    if let Some(home) = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE")) {
+        paths.push(PathBuf::from(home).join(".claude").join("settings.json"));
+    }
+
+    for path in paths {
+        let Ok(contents) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(root) = serde_json::from_str::<Value>(&contents) else {
+            continue;
+        };
+        let value = root
+            .get("env")
+            .and_then(Value::as_object)
+            .and_then(|env| env.get(key))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if let Some(value) = value {
+            return Some(value.to_string());
+        }
+    }
+
+    None
+}
+
 fn resolve_repl_model(cli_model: String) -> String {
     if cli_model != DEFAULT_MODEL {
         return cli_model;
@@ -1108,6 +1139,9 @@ fn resolve_repl_model(cli_model: String) -> String {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
     {
+        return resolve_model_alias_with_config(&env_model);
+    }
+    if let Some(env_model) = claude_settings_env_value("ANTHROPIC_MODEL") {
         return resolve_model_alias_with_config(&env_model);
     }
     if let Some(config_model) = config_model_for_current_dir() {
@@ -10138,6 +10172,46 @@ mod tests {
         assert_eq!(resolved, DEFAULT_MODEL);
 
         std::env::remove_var("CLAW_CONFIG_HOME");
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn resolve_repl_model_falls_back_to_claude_settings_env_when_process_env_unset() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        let home = root.join("home");
+        let claude_dir = home.join(".claude");
+        fs::create_dir_all(&claude_dir).expect("claude dir");
+        fs::write(
+            claude_dir.join("settings.json"),
+            r#"{"env":{"ANTHROPIC_MODEL":"claude-sonnet-4-6"}}"#,
+        )
+        .expect("write settings");
+
+        let original_home = std::env::var_os("HOME");
+        let original_claw_home = std::env::var_os("CLAW_CONFIG_HOME");
+        let original_claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("ANTHROPIC_MODEL");
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+        let resolved = with_current_dir(&root, || resolve_repl_model(DEFAULT_MODEL.to_string()));
+
+        assert_eq!(resolved, "claude-sonnet-4-6");
+
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_claw_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_claude_config_dir {
+            Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
