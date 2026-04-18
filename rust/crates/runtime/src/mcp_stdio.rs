@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
 
 use crate::config::{McpTransport, RuntimeConfig, ScopedMcpServerConfig};
@@ -464,6 +464,7 @@ struct ManagedMcpServer {
     bootstrap: McpClientBootstrap,
     process: Option<McpStdioProcess>,
     initialized: bool,
+    stdio_mode: McpStdioMode,
 }
 
 impl ManagedMcpServer {
@@ -472,8 +473,15 @@ impl ManagedMcpServer {
             bootstrap,
             process: None,
             initialized: false,
+            stdio_mode: McpStdioMode::Framed,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpStdioMode {
+    Framed,
+    LineDelimitedJson,
 }
 
 #[derive(Debug)]
@@ -1013,6 +1021,39 @@ impl McpServerManager {
         )
     }
 
+    async fn should_try_line_delimited_fallback(
+        &mut self,
+        server_name: &str,
+        error: &McpServerManagerError,
+    ) -> Result<bool, McpServerManagerError> {
+        let server = self.server_mut(server_name)?;
+        if server.stdio_mode != McpStdioMode::Framed {
+            return Ok(false);
+        }
+
+        let stderr = match server.process.as_mut() {
+            Some(process) => process.read_available_stderr().await.unwrap_or_default(),
+            None => String::new(),
+        };
+        let normalized = stderr.to_ascii_lowercase();
+        Ok(matches!(
+            error,
+            McpServerManagerError::Timeout {
+                method: "initialize",
+                ..
+            }
+                | McpServerManagerError::InvalidResponse {
+                    method: "initialize",
+                    ..
+                }
+                | McpServerManagerError::Transport {
+                    method: "initialize",
+                    ..
+                }
+        ) && normalized.contains("content-length")
+            && normalized.contains("invalid json"))
+    }
+
     async fn run_process_request<T, F>(
         server_name: &str,
         method: &'static str,
@@ -1064,7 +1105,7 @@ impl McpServerManager {
 
             if needs_spawn {
                 let server = self.server_mut(server_name)?;
-                server.process = Some(spawn_mcp_stdio_process(&server.bootstrap)?);
+                server.process = Some(spawn_mcp_stdio_process_with_mode(&server.bootstrap, server.stdio_mode)?);
                 server.initialized = false;
             }
 
@@ -1100,6 +1141,16 @@ impl McpServerManager {
             };
 
             let response = match response {
+                Err(error)
+                    if attempts == 0
+                        && self.should_try_line_delimited_fallback(server_name, &error).await? =>
+                {
+                    self.reset_server(server_name).await?;
+                    let server = self.server_mut(server_name)?;
+                    server.stdio_mode = McpStdioMode::LineDelimitedJson;
+                    attempts += 1;
+                    continue;
+                }
                 Ok(response) => response,
                 Err(error) if attempts == 0 && Self::is_retryable_error(&error) => {
                     self.reset_server(server_name).await?;
@@ -1144,16 +1195,22 @@ pub struct McpStdioProcess {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    stderr: BufReader<ChildStderr>,
+    mode: McpStdioMode,
 }
 
 impl McpStdioProcess {
     pub fn spawn(transport: &McpStdioTransport) -> io::Result<Self> {
+        Self::spawn_with_mode(transport, McpStdioMode::Framed)
+    }
+
+    fn spawn_with_mode(transport: &McpStdioTransport, mode: McpStdioMode) -> io::Result<Self> {
         let mut command = Command::new(&transport.command);
         command
             .args(&transport.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::piped());
         apply_env(&mut command, &transport.env);
 
         let mut child = command.spawn()?;
@@ -1165,11 +1222,17 @@ impl McpStdioProcess {
             .stdout
             .take()
             .ok_or_else(|| io::Error::other("stdio MCP process missing stdout pipe"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("stdio MCP process missing stderr pipe"))?;
 
         Ok(Self {
             child,
             stdin,
             stdout: BufReader::new(stdout),
+            stderr: BufReader::new(stderr),
+            mode,
         })
     }
 
@@ -1249,13 +1312,58 @@ impl McpStdioProcess {
     pub async fn write_jsonrpc_message<T: Serialize>(&mut self, message: &T) -> io::Result<()> {
         let body = serde_json::to_vec(message)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        self.write_frame(&body).await
+        match self.mode {
+            McpStdioMode::Framed => self.write_frame(&body).await,
+            McpStdioMode::LineDelimitedJson => {
+                self.write_all(&body).await?;
+                self.write_all(b"\n").await?;
+                self.flush().await
+            }
+        }
     }
 
     pub async fn read_jsonrpc_message<T: DeserializeOwned>(&mut self) -> io::Result<T> {
-        let payload = self.read_frame().await?;
-        serde_json::from_slice(&payload)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        let payload = match self.mode {
+            McpStdioMode::Framed => self.read_frame().await?,
+            McpStdioMode::LineDelimitedJson => self.read_line_delimited_json().await?,
+        };
+        serde_json::from_slice(&payload).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+
+    async fn read_line_delimited_json(&mut self) -> io::Result<Vec<u8>> {
+        loop {
+            let mut line = String::new();
+            let bytes_read = self.stdout.read_line(&mut line).await?;
+            if bytes_read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "MCP stdio stream closed while reading line-delimited JSON",
+                ));
+            }
+            let line = line.trim_end_matches(['\r', '\n']);
+            if line.is_empty() {
+                continue;
+            }
+            return Ok(line.as_bytes().to_vec());
+        }
+    }
+
+    pub async fn read_available_stderr(&mut self) -> io::Result<String> {
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            match timeout(Duration::from_millis(20), self.stderr.read(&mut chunk)).await {
+                Ok(Ok(0)) | Err(_) => break,
+                Ok(Ok(read)) => {
+                    buffer.extend_from_slice(&chunk[..read]);
+                    if read < chunk.len() {
+                        break;
+                    }
+                }
+                Ok(Err(error)) => return Err(error),
+            }
+        }
+        Ok(String::from_utf8_lossy(&buffer).into_owned())
     }
 
     pub async fn send_request<T: Serialize>(
@@ -1368,9 +1476,18 @@ impl McpStdioProcess {
     }
 }
 
-pub fn spawn_mcp_stdio_process(bootstrap: &McpClientBootstrap) -> io::Result<McpStdioProcess> {
+pub fn spawn_mcp_stdio_process(
+    bootstrap: &McpClientBootstrap,
+) -> io::Result<McpStdioProcess> {
+    spawn_mcp_stdio_process_with_mode(bootstrap, McpStdioMode::Framed)
+}
+
+fn spawn_mcp_stdio_process_with_mode(
+    bootstrap: &McpClientBootstrap,
+    mode: McpStdioMode,
+) -> io::Result<McpStdioProcess> {
     match &bootstrap.transport {
-        McpClientTransport::Stdio(transport) => McpStdioProcess::spawn(transport),
+        McpClientTransport::Stdio(transport) => McpStdioProcess::spawn_with_mode(transport, mode),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
@@ -1429,7 +1546,8 @@ mod tests {
         spawn_mcp_stdio_process, unsupported_server_failed_server, JsonRpcId, JsonRpcRequest,
         JsonRpcResponse, McpInitializeClientInfo, McpInitializeParams, McpInitializeResult,
         McpInitializeServerInfo, McpListToolsResult, McpReadResourceParams, McpReadResourceResult,
-        McpServerManager, McpServerManagerError, McpStdioProcess, McpTool, McpToolCallParams,
+        McpServerManager, McpServerManagerError, McpStdioMode, McpStdioProcess, McpTool,
+        McpToolCallParams,
     };
     use crate::McpLifecyclePhase;
 
@@ -1494,6 +1612,45 @@ mod tests {
             r"}).encode()",
             r"sys.stdout.buffer.write(f'{header_name}: {len(response)}\r\n\r\n'.encode() + response)",
             "sys.stdout.buffer.flush()",
+            "",
+        ]
+        .join("\n");
+        fs::write(&script_path, script).expect("write script");
+        let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).expect("chmod");
+        script_path
+    }
+
+    fn write_line_delimited_jsonrpc_script() -> PathBuf {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("temp dir");
+        let script_path = root.join("line-jsonrpc-mcp.py");
+        let script = [
+            "#!/usr/bin/env python3",
+            "import json, sys",
+            "for raw_line in sys.stdin:",
+            "    line = raw_line.strip()",
+            "    if not line:",
+            "        continue",
+            "    try:",
+            "        request = json.loads(line)",
+            "    except json.JSONDecodeError:",
+            "        sys.stderr.write(f'Invalid JSON line: {line}\\n')",
+            "        sys.stderr.flush()",
+            "        continue",
+            "    response = {",
+            "        'jsonrpc': '2.0',",
+            "        'id': request['id'],",
+            "        'result': {",
+            "            'protocolVersion': request['params']['protocolVersion'],",
+            "            'capabilities': {'tools': {}},",
+            "            'serverInfo': {'name': 'fake-line-mcp', 'version': '0.1.0'}",
+            "        }",
+            "    }",
+            "    sys.stdout.write(json.dumps(response) + '\\n')",
+            "    sys.stdout.flush()",
+            "    break",
             "",
         ]
         .join("\n");
@@ -1763,6 +1920,85 @@ mod tests {
         script_path
     }
 
+    fn write_line_delimited_manager_mcp_server_script() -> PathBuf {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("temp dir");
+        let script_path = root.join("line-manager-mcp-server.py");
+        let script = [
+            "#!/usr/bin/env python3",
+            "import json, os, sys",
+            "LOG_PATH = os.environ.get('MCP_LOG_PATH')",
+            "def log(value):",
+            "    if LOG_PATH:",
+            "        with open(LOG_PATH, 'a', encoding='utf-8') as handle:",
+            "            handle.write(value + '\\n')",
+            "for raw_line in sys.stdin:",
+            "    line = raw_line.strip()",
+            "    if not line:",
+            "        continue",
+            "    try:",
+            "        request = json.loads(line)",
+            "    except json.JSONDecodeError:",
+            "        sys.stderr.write(f'Invalid JSON line: {line}\\n')",
+            "        sys.stderr.flush()",
+            "        continue",
+            "    method = request['method']",
+            "    log(method)",
+            "    if method == 'initialize':",
+            "        response = {",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {",
+            "                'protocolVersion': request['params']['protocolVersion'],",
+            "                'capabilities': {'tools': {}},",
+            "                'serverInfo': {'name': 'line-server', 'version': '1.0.0'}",
+            "            }",
+            "        }",
+            "    elif method == 'tools/list':",
+            "        response = {",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {",
+            "                'tools': [{",
+            "                    'name': 'echo',",
+            "                    'description': 'Echo tool',",
+            "                    'inputSchema': {",
+            "                        'type': 'object',",
+            "                        'properties': {'text': {'type': 'string'}},",
+            "                        'required': ['text']",
+            "                    }",
+            "                }]",
+            "            }",
+            "        }",
+            "    elif method == 'tools/call':",
+            "        text = (request.get('params') or {}).get('arguments', {}).get('text', '')",
+            "        response = {",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {",
+            "                'content': [{'type': 'text', 'text': f'echo:{text}'}],",
+            "                'structuredContent': {'echoed': text},",
+            "                'isError': False",
+            "            }",
+            "        }",
+            "    else:",
+            "        response = {",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'error': {'code': -32601, 'message': f'unknown method: {method}'}",
+            "        }",
+            "    sys.stdout.write(json.dumps(response) + '\\n')",
+            "    sys.stdout.flush()",
+            "",
+        ]
+        .join("\n");
+        fs::write(&script_path, script).expect("write script");
+        let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).expect("chmod");
+        script_path
+    }
+
     fn sample_bootstrap(script_path: &Path) -> McpClientBootstrap {
         let config = ScopedMcpServerConfig {
             scope: ConfigSource::Local,
@@ -1851,7 +2087,8 @@ mod tests {
         runtime.block_on(async {
             let script_path = write_echo_script();
             let bootstrap = sample_bootstrap(&script_path);
-            let mut process = spawn_mcp_stdio_process(&bootstrap).expect("spawn stdio process");
+            let mut process =
+                spawn_mcp_stdio_process(&bootstrap).expect("spawn stdio process");
 
             let ready = process.read_line().await.expect("read ready");
             assert_eq!(ready, "READY:secret-value\n");
@@ -1880,7 +2117,8 @@ mod tests {
             }),
         };
         let bootstrap = McpClientBootstrap::from_scoped_config("sdk server", &config);
-        let error = spawn_mcp_stdio_process(&bootstrap).expect_err("non-stdio should fail");
+        let error =
+            spawn_mcp_stdio_process(&bootstrap).expect_err("non-stdio should fail");
         assert_eq!(error.kind(), ErrorKind::InvalidInput);
     }
 
@@ -1919,6 +2157,55 @@ mod tests {
                     capabilities: json!({"tools": {}}),
                     server_info: McpInitializeServerInfo {
                         name: "fake-mcp".to_string(),
+                        version: "0.1.0".to_string(),
+                    },
+                })
+            );
+
+            let status = process.wait().await.expect("wait for exit");
+            assert!(status.success());
+
+            cleanup_script(&script_path);
+        });
+    }
+
+    #[test]
+    fn round_trips_initialize_request_and_response_over_line_delimited_json() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script_path = write_line_delimited_jsonrpc_script();
+            let transport = script_transport(&script_path);
+            let mut process =
+                McpStdioProcess::spawn_with_mode(&transport, McpStdioMode::LineDelimitedJson)
+                .expect("spawn transport directly");
+
+            let response = process
+                .initialize(
+                    JsonRpcId::Number(11),
+                    McpInitializeParams {
+                        protocol_version: "2025-03-26".to_string(),
+                        capabilities: json!({"roots": {}}),
+                        client_info: McpInitializeClientInfo {
+                            name: "runtime-tests".to_string(),
+                            version: "0.1.0".to_string(),
+                        },
+                    },
+                )
+                .await
+                .expect("initialize roundtrip");
+
+            assert_eq!(response.id, JsonRpcId::Number(11));
+            assert_eq!(response.error, None);
+            assert_eq!(
+                response.result,
+                Some(McpInitializeResult {
+                    protocol_version: "2025-03-26".to_string(),
+                    capabilities: json!({"tools": {}}),
+                    server_info: McpInitializeServerInfo {
+                        name: "fake-line-mcp".to_string(),
                         version: "0.1.0".to_string(),
                     },
                 })
@@ -2519,6 +2806,55 @@ mod tests {
             assert_eq!(
                 log.lines().collect::<Vec<_>>(),
                 vec!["initialize", "initialize-hang", "initialize", "tools/list"]
+            );
+
+            manager.shutdown().await.expect("shutdown");
+            cleanup_script(&script_path);
+        });
+    }
+
+    #[test]
+    fn given_line_delimited_server_when_discovering_tools_then_manager_falls_back_and_succeeds() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script_path = write_line_delimited_manager_mcp_server_script();
+            let root = script_path.parent().expect("script parent");
+            let log_path = root.join("line-manager.log");
+            let servers = BTreeMap::from([(
+                "alpha".to_string(),
+                manager_server_config_with_env(
+                    &script_path,
+                    "alpha",
+                    &log_path,
+                    BTreeMap::new(),
+                ),
+            )]);
+            let mut manager = McpServerManager::from_servers(&servers);
+
+            let tools = manager.discover_tools().await.expect("discover tools");
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0].qualified_name, mcp_tool_name("alpha", "echo"));
+
+            let response = manager
+                .call_tool(&mcp_tool_name("alpha", "echo"), Some(json!({"text": "hello"})))
+                .await
+                .expect("call tool through line-delimited fallback");
+            assert_eq!(
+                response
+                    .result
+                    .expect("tool result")
+                    .structured_content
+                    .expect("structured content"),
+                json!({"echoed": "hello"})
+            );
+
+            let log = fs::read_to_string(&log_path).expect("read log");
+            assert_eq!(
+                log.lines().collect::<Vec<_>>(),
+                vec!["initialize", "tools/list", "tools/call"]
             );
 
             manager.shutdown().await.expect("shutdown");
