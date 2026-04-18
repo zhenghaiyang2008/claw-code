@@ -10,7 +10,7 @@ mod init;
 mod input;
 mod render;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -18,6 +18,7 @@ use std::net::TcpListener;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc as std_mpsc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -75,6 +76,7 @@ const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
+const STARTUP_MCP_DISCOVERY_TIMEOUT_MS: u64 = 12_000;
 const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
@@ -3325,17 +3327,176 @@ struct ReadMcpResourceRequest {
     uri: String,
 }
 
+fn startup_discover_mcp_best_effort(
+    runtime_config: &runtime::RuntimeConfig,
+) -> runtime::McpToolDiscoveryReport {
+    let supported = runtime_config
+        .mcp()
+        .servers()
+        .iter()
+        .filter(|(_, config)| config.transport() == runtime::McpTransport::Stdio)
+        .map(|(name, config)| (name.clone(), config.clone()))
+        .collect::<Vec<_>>();
+
+    let unsupported = runtime_config
+        .mcp()
+        .servers()
+        .iter()
+        .filter(|(_, config)| config.transport() != runtime::McpTransport::Stdio)
+        .map(|(server_name, config)| runtime::UnsupportedMcpServer {
+            server_name: server_name.clone(),
+            transport: config.transport(),
+            reason: format!(
+                "transport {:?} is not supported by McpServerManager",
+                config.transport()
+            ),
+        })
+        .collect::<Vec<_>>();
+
+    if supported.is_empty() {
+        return runtime::McpToolDiscoveryReport {
+            tools: Vec::new(),
+            failed_servers: Vec::new(),
+            unsupported_servers: unsupported,
+            degraded_startup: None,
+        };
+    }
+
+    #[derive(Debug)]
+    struct StartupDiscoveryResult {
+        report: runtime::McpToolDiscoveryReport,
+    }
+
+    let (tx, rx) = std_mpsc::channel();
+    for (server_name, config) in supported {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let mut servers = BTreeMap::new();
+            servers.insert(server_name.clone(), config);
+            let report = match tokio::runtime::Runtime::new() {
+                Ok(rt) => {
+                    let mut manager = McpServerManager::from_servers(&servers);
+                    match rt.block_on(async {
+                        tokio::time::timeout(
+                            Duration::from_millis(STARTUP_MCP_DISCOVERY_TIMEOUT_MS),
+                            manager.discover_tools_best_effort(),
+                        )
+                        .await
+                    }) {
+                        Ok(report) => report,
+                        Err(_) => runtime::McpToolDiscoveryReport {
+                            tools: Vec::new(),
+                            failed_servers: vec![runtime::McpDiscoveryFailure {
+                                server_name: server_name.clone(),
+                                phase: runtime::McpLifecyclePhase::ToolDiscovery,
+                                error: format!(
+                                    "MCP startup discovery timed out after {} ms",
+                                    STARTUP_MCP_DISCOVERY_TIMEOUT_MS
+                                ),
+                                recoverable: true,
+                                context: BTreeMap::from([(
+                                    "timeout_ms".to_string(),
+                                    STARTUP_MCP_DISCOVERY_TIMEOUT_MS.to_string(),
+                                )]),
+                            }],
+                            unsupported_servers: Vec::new(),
+                            degraded_startup: None,
+                        },
+                    }
+                }
+                Err(error) => runtime::McpToolDiscoveryReport {
+                    tools: Vec::new(),
+                    failed_servers: vec![runtime::McpDiscoveryFailure {
+                        server_name: server_name.clone(),
+                        phase: runtime::McpLifecyclePhase::SpawnConnect,
+                        error: format!("failed to create tokio runtime for MCP startup discovery: {error}"),
+                        recoverable: false,
+                        context: BTreeMap::new(),
+                    }],
+                    unsupported_servers: Vec::new(),
+                    degraded_startup: None,
+                },
+            };
+            let _ = tx.send(StartupDiscoveryResult { report });
+        });
+    }
+    drop(tx);
+
+    let mut tools = Vec::new();
+    let mut failed_servers = Vec::new();
+    let mut unsupported_servers = unsupported;
+    while let Ok(result) = rx.recv() {
+        tools.extend(result.report.tools);
+        failed_servers.extend(result.report.failed_servers);
+        unsupported_servers.extend(result.report.unsupported_servers);
+    }
+
+    let working_servers = tools
+        .iter()
+        .map(|tool| tool.server_name.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let degraded_failed_servers = failed_servers
+        .iter()
+        .map(|failure| runtime::McpFailedServer {
+            server_name: failure.server_name.clone(),
+            phase: failure.phase,
+            error: runtime::McpErrorSurface::new(
+                failure.phase,
+                Some(failure.server_name.clone()),
+                failure.error.clone(),
+                failure.context.clone(),
+                failure.recoverable,
+            ),
+        })
+        .chain(unsupported_servers.iter().map(|server| runtime::McpFailedServer {
+            server_name: server.server_name.clone(),
+            phase: runtime::McpLifecyclePhase::ServerRegistration,
+            error: runtime::McpErrorSurface::new(
+                runtime::McpLifecyclePhase::ServerRegistration,
+                Some(server.server_name.clone()),
+                server.reason.clone(),
+                BTreeMap::from([(
+                    "transport".to_string(),
+                    format!("{:?}", server.transport).to_ascii_lowercase(),
+                )]),
+                false,
+            ),
+        }))
+        .collect::<Vec<_>>();
+    let available_tools = tools
+        .iter()
+        .map(|tool| tool.qualified_name.clone())
+        .collect::<Vec<_>>();
+    let degraded_startup = (!degraded_failed_servers.is_empty()).then(|| {
+        runtime::McpDegradedReport::new(
+            working_servers,
+            degraded_failed_servers,
+            available_tools.clone(),
+            available_tools.clone(),
+        )
+    });
+
+    runtime::McpToolDiscoveryReport {
+        tools,
+        failed_servers,
+        unsupported_servers,
+        degraded_startup,
+    }
+}
+
 impl RuntimeMcpState {
     fn new(
         runtime_config: &runtime::RuntimeConfig,
     ) -> Result<Option<(Self, runtime::McpToolDiscoveryReport)>, Box<dyn std::error::Error>> {
-        let mut manager = McpServerManager::from_runtime_config(runtime_config);
+        let manager = McpServerManager::from_runtime_config(runtime_config);
         if manager.server_names().is_empty() && manager.unsupported_servers().is_empty() {
             return Ok(None);
         }
 
         let runtime = tokio::runtime::Runtime::new()?;
-        let discovery = runtime.block_on(manager.discover_tools_best_effort());
+        let discovery = startup_discover_mcp_best_effort(runtime_config);
         let pending_servers = discovery
             .failed_servers
             .iter()
@@ -3434,10 +3595,21 @@ impl RuntimeMcpState {
         qualified_tool_name: &str,
         arguments: Option<serde_json::Value>,
     ) -> Result<String, ToolError> {
-        let response = self
+        let response = match self
             .runtime
-            .block_on(self.manager.call_tool(qualified_tool_name, arguments))
-            .map_err(|error| ToolError::new(error.to_string()))?;
+            .block_on(self.manager.call_tool(qualified_tool_name, arguments.clone()))
+        {
+            Err(runtime::McpServerManagerError::UnknownTool { .. }) => {
+                self.runtime
+                    .block_on(self.manager.discover_tools())
+                    .map_err(|error| ToolError::new(error.to_string()))?;
+                self.runtime
+                    .block_on(self.manager.call_tool(qualified_tool_name, arguments))
+                    .map_err(|error| ToolError::new(error.to_string()))?
+            }
+            Err(error) => return Err(ToolError::new(error.to_string())),
+            Ok(response) => response,
+        };
         if let Some(error) = response.error {
             return Err(ToolError::new(format!(
                 "MCP tool `{qualified_tool_name}` returned JSON-RPC error: {} ({})",
