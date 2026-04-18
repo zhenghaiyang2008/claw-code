@@ -8328,6 +8328,53 @@ mod tests {
     }
 
     #[test]
+    fn skill_loads_legacy_command_from_claude_home() {
+        let _guard = env_guard();
+        let root = temp_path("claude-home-legacy-command");
+        let home = root.join("home");
+        let command_dir = home.join(".claude").join("commands");
+        fs::create_dir_all(&command_dir).expect("command dir should exist");
+        fs::write(
+            command_dir.join("handoff.md"),
+            "---\nname: handoff\ndescription: Claude home command\n---\n# handoff\n",
+        )
+        .expect("command file should exist");
+
+        let original_home = std::env::var("HOME").ok();
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_codex_home = std::env::var("CODEX_HOME").ok();
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var("CODEX_HOME");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let result =
+            execute_tool("Skill", &json!({ "skill": "/handoff" })).expect("command should resolve");
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        assert!(output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with(".claude/commands/handoff.md"));
+        assert_eq!(output["description"], "Claude home command");
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_codex_home {
+            Some(value) => std::env::set_var("CODEX_HOME", value),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        fs::remove_dir_all(root).expect("temp tree should clean up");
+    }
+
+    #[test]
     fn tool_search_supports_keyword_and_select_queries() {
         let keyword = execute_tool(
             "ToolSearch",
@@ -8440,6 +8487,62 @@ mod tests {
         let named_output: serde_json::Value = serde_json::from_str(&named).expect("valid json");
         assert_eq!(named_output["name"], "ship-audit");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn claude_home_agents_are_listed_and_can_share_the_existing_agent_execution_path() {
+        let _guard = env_guard();
+        let root = temp_path("claude-home-agents");
+        let home = root.join("home");
+        let workspace = root.join("workspace");
+        let agents_dir = home.join(".claude").join("agents");
+        fs::create_dir_all(&agents_dir).expect("agents dir should exist");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        fs::write(
+            agents_dir.join("planner.toml"),
+            "name = \"planner\"\ndescription = \"Claude planner\"\nmodel = \"gpt-5.4\"\nmodel_reasoning_effort = \"medium\"\n",
+        )
+        .expect("agent file should exist");
+
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+
+        let report = commands::handle_agents_slash_command(Some("list"), &workspace)
+            .expect("agents list should succeed");
+        assert!(report.contains("planner · Claude planner"));
+
+        let output = execute_agent_with_spawn(
+            AgentInput {
+                description: "Use claude planner agent".to_string(),
+                prompt: "Produce a planning summary".to_string(),
+                subagent_type: Some("Plan".to_string()),
+                name: Some("planner".to_string()),
+                model: None,
+            },
+            |job| {
+                persist_agent_terminal_state(
+                    &job.manifest,
+                    "completed",
+                    Some("completed planning lane with context"),
+                    None,
+                )
+            },
+        )
+        .expect("agent should spawn");
+
+        assert_eq!(output.name, "planner");
+        assert_eq!(output.status, "running");
+        let manifest_contents =
+            std::fs::read_to_string(&output.manifest_file).expect("manifest file should exist");
+        let manifest_json: serde_json::Value =
+            serde_json::from_str(&manifest_contents).expect("manifest json");
+        assert_eq!(manifest_json["status"], "completed");
+
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        fs::remove_dir_all(root).expect("temp tree should clean up");
     }
 
     #[test]
