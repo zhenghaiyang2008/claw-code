@@ -3183,10 +3183,11 @@ impl BuiltRuntime {
     }
 
     fn with_hook_abort_signal(mut self, hook_abort_signal: runtime::HookAbortSignal) -> Self {
-        let runtime = self
+        let mut runtime = self
             .runtime
             .take()
             .expect("runtime should exist before installing hook abort signal");
+        runtime.api_client_mut().set_abort_signal(hook_abort_signal.clone());
         self.runtime = Some(runtime.with_hook_abort_signal(hook_abort_signal));
         self
     }
@@ -6700,6 +6701,7 @@ struct AnthropicRuntimeClient {
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
     reasoning_effort: Option<String>,
+    abort_signal: Option<runtime::HookAbortSignal>,
 }
 
 impl AnthropicRuntimeClient {
@@ -6765,11 +6767,16 @@ impl AnthropicRuntimeClient {
             tool_registry,
             progress_reporter,
             reasoning_effort: None,
+            abort_signal: None,
         })
     }
 
     fn set_reasoning_effort(&mut self, effort: Option<String>) {
         self.reasoning_effort = effort;
+    }
+
+    fn set_abort_signal(&mut self, abort_signal: runtime::HookAbortSignal) {
+        self.abort_signal = Some(abort_signal);
     }
 }
 
@@ -6840,13 +6847,20 @@ impl AnthropicRuntimeClient {
         message_request: &MessageRequest,
         apply_stall_timeout: bool,
     ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        let mut stream = self
-            .client
-            .stream_message(message_request)
-            .await
-            .map_err(|error| {
-                RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-            })?;
+        let abort_signal = self.abort_signal.clone();
+        let mut stream = if let Some(abort_signal) = abort_signal.as_ref() {
+            tokio::select! {
+                stream = self.client.stream_message(message_request) => stream,
+                _ = wait_for_abort(abort_signal.clone()) => {
+                    return Err(RuntimeError::new("request cancelled by Ctrl+C"));
+                }
+            }
+        } else {
+            self.client.stream_message(message_request).await
+        }
+        .map_err(|error| {
+            RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+        })?;
         let mut stdout = io::stdout();
         let mut sink = io::sink();
         let out: &mut dyn Write = if self.emit_output {
@@ -6863,8 +6877,16 @@ impl AnthropicRuntimeClient {
         let mut received_any_event = false;
 
         loop {
+            if abort_signal.as_ref().is_some_and(runtime::HookAbortSignal::is_aborted) {
+                return Err(RuntimeError::new("request cancelled by Ctrl+C"));
+            }
             let next = if apply_stall_timeout && !received_any_event {
-                match tokio::time::timeout(POST_TOOL_STALL_TIMEOUT, stream.next_event()).await {
+                match tokio::time::timeout(
+                    POST_TOOL_STALL_TIMEOUT,
+                    next_stream_event_or_abort(&mut stream, abort_signal.as_ref()),
+                )
+                .await
+                {
                     Ok(inner) => inner.map_err(|error| {
                         RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
                     })?,
@@ -6875,9 +6897,11 @@ impl AnthropicRuntimeClient {
                     }
                 }
             } else {
-                stream.next_event().await.map_err(|error| {
-                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                })?
+                next_stream_event_or_abort(&mut stream, abort_signal.as_ref())
+                    .await
+                    .map_err(|error| {
+                        RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
+                    })?
             };
 
             let Some(event) = next else {
@@ -6999,6 +7023,26 @@ impl AnthropicRuntimeClient {
         let mut events = response_to_events(response, out)?;
         push_prompt_cache_record(&self.client, &mut events);
         Ok(events)
+    }
+}
+
+async fn next_stream_event_or_abort(
+    stream: &mut api::MessageStream,
+    abort_signal: Option<&runtime::HookAbortSignal>,
+) -> Result<Option<ApiStreamEvent>, api::ApiError> {
+    if let Some(abort_signal) = abort_signal {
+        tokio::select! {
+            next = stream.next_event() => next,
+            _ = wait_for_abort(abort_signal.clone()) => Err(api::ApiError::Io(std::io::Error::new(std::io::ErrorKind::Interrupted, "request cancelled by Ctrl+C"))),
+        }
+    } else {
+        stream.next_event().await
+    }
+}
+
+async fn wait_for_abort(abort_signal: runtime::HookAbortSignal) {
+    while !abort_signal.is_aborted() {
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
@@ -11683,10 +11727,21 @@ fn write_mcp_server_fixture(script_path: &Path) {
 
 #[cfg(test)]
 mod sandbox_report_tests {
-    use super::{format_sandbox_report, HookAbortMonitor};
-    use runtime::HookAbortSignal;
-    use std::sync::mpsc;
+    use super::{format_sandbox_report, AnthropicRuntimeClient, HookAbortMonitor};
+    use runtime::{ApiClient, ApiRequest, ConversationMessage, HookAbortSignal};
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::sync::{mpsc, Mutex, MutexGuard, OnceLock};
+    use std::thread;
     use std::time::Duration;
+    use tools::GlobalToolRegistry;
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     #[test]
     fn sandbox_report_renders_expected_fields() {
@@ -11734,6 +11789,64 @@ mod sandbox_report_tests {
         monitor.stop();
 
         assert!(abort_signal.is_aborted());
+    }
+
+    #[test]
+    fn pre_aborted_hook_signal_short_circuits_anthropic_runtime_client() {
+        let _guard = env_lock();
+        let abort_signal = HookAbortSignal::new();
+        abort_signal.abort();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let address = listener.local_addr().expect("local addr");
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buffer = [0_u8; 4096];
+            let _ = stream.read(&mut buffer);
+            thread::sleep(Duration::from_secs(5));
+        });
+
+        let original_api_key = std::env::var_os("ANTHROPIC_API_KEY");
+        let original_auth_token = std::env::var_os("ANTHROPIC_AUTH_TOKEN");
+        let original_base_url = std::env::var_os("ANTHROPIC_BASE_URL");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::set_var("ANTHROPIC_AUTH_TOKEN", "test-token");
+        std::env::set_var("ANTHROPIC_BASE_URL", format!("http://{address}"));
+
+        let mut client = AnthropicRuntimeClient::new(
+            "session-abort",
+            "claude-sonnet-4-6".to_string(),
+            false,
+            false,
+            None,
+            GlobalToolRegistry::builtin(),
+            None,
+        )
+        .expect("runtime client should build");
+        client.set_abort_signal(abort_signal);
+
+        let start = std::time::Instant::now();
+        let error = client
+            .stream(ApiRequest {
+                system_prompt: vec!["system".to_string()],
+                messages: vec![ConversationMessage::user_text("hello")],
+            })
+            .expect_err("aborted request should fail quickly");
+
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(error.to_string().contains("cancelled"));
+
+        match original_api_key {
+            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
+            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        }
+        match original_auth_token {
+            Some(value) => std::env::set_var("ANTHROPIC_AUTH_TOKEN", value),
+            None => std::env::remove_var("ANTHROPIC_AUTH_TOKEN"),
+        }
+        match original_base_url {
+            Some(value) => std::env::set_var("ANTHROPIC_BASE_URL", value),
+            None => std::env::remove_var("ANTHROPIC_BASE_URL"),
+        }
     }
 }
 
