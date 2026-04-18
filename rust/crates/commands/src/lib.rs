@@ -3792,7 +3792,7 @@ fn render_mcp_usage(unexpected: Option<&str>) -> String {
         "MCP".to_string(),
         "  Usage            /mcp [list|show <server>|help]".to_string(),
         "  Direct CLI       claw mcp [list|show <server>|help]".to_string(),
-        "  Sources          .claw/settings.json, .claw/settings.local.json".to_string(),
+        "  Sources          ~/.claw/settings.json, ~/.claude/settings.json, CLAUDE_CONFIG_DIR/settings.json, .claw/settings.json, .claw/settings.local.json".to_string(),
     ];
     if let Some(args) = unexpected {
         lines.push(format!("  Unexpected       {args}"));
@@ -3807,7 +3807,13 @@ fn render_mcp_usage_json(unexpected: Option<&str>) -> Value {
         "usage": {
             "slash_command": "/mcp [list|show <server>|help]",
             "direct_cli": "claw mcp [list|show <server>|help]",
-            "sources": [".claw/settings.json", ".claw/settings.local.json"],
+            "sources": [
+                "~/.claw/settings.json",
+                "~/.claude/settings.json",
+                "CLAUDE_CONFIG_DIR/settings.json",
+                ".claw/settings.json",
+                ".claw/settings.local.json"
+            ],
         },
         "unexpected": unexpected,
     })
@@ -5412,6 +5418,8 @@ mod tests {
         let help = super::handle_mcp_slash_command(Some("help"), &cwd).expect("mcp help");
         assert!(help.contains("Usage            /mcp [list|show <server>|help]"));
         assert!(help.contains("Direct CLI       claw mcp [list|show <server>|help]"));
+        assert!(help.contains("~/.claude/settings.json"));
+        assert!(help.contains("CLAUDE_CONFIG_DIR/settings.json"));
 
         let unexpected =
             super::handle_mcp_slash_command(Some("show alpha beta"), &cwd).expect("mcp usage");
@@ -5426,6 +5434,15 @@ mod tests {
             super::handle_mcp_slash_command(Some("inspect --help"), &cwd).expect("mcp usage");
         assert!(unknown_help.contains("Usage            /mcp [list|show <server>|help]"));
         assert!(unknown_help.contains("Unexpected       inspect"));
+
+        let help_json = super::handle_mcp_slash_command_json(Some("help"), &cwd).expect("mcp help json");
+        let sources = help_json["usage"]["sources"]
+            .as_array()
+            .expect("mcp help sources");
+        assert!(sources.iter().any(|value| value == "~/.claude/settings.json"));
+        assert!(sources
+            .iter()
+            .any(|value| value == "CLAUDE_CONFIG_DIR/settings.json"));
 
         let _ = fs::remove_dir_all(cwd);
     }
@@ -5583,10 +5600,49 @@ mod tests {
         let help =
             render_mcp_report_json_for(&loader, &workspace, Some("help")).expect("mcp help json");
         assert_eq!(help["action"], "help");
-        assert_eq!(help["usage"]["sources"][0], ".claw/settings.json");
+        assert_eq!(help["usage"]["sources"][0], "~/.claw/settings.json");
+        assert_eq!(help["usage"]["sources"][1], "~/.claude/settings.json");
 
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(config_home);
+    }
+
+    #[test]
+    fn render_mcp_report_includes_claude_home_servers() {
+        let root = temp_dir("mcp-claude-home");
+        let workspace = root.join("workspace");
+        let claw_home = root.join("home").join(".claw");
+        let claude_home = root.join("home").join(".claude");
+        fs::create_dir_all(workspace.join(".claw")).expect("workspace config dir");
+        fs::create_dir_all(&claw_home).expect("claw home");
+        fs::create_dir_all(&claude_home).expect("claude home");
+
+        let original_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", root.join("home"));
+        fs::write(
+            claude_home.join("settings.json"),
+            r#"{
+              "mcpServers": {
+                "claude-home": {
+                  "command": "uvx",
+                  "args": ["claude-home"]
+                }
+              }
+            }"#,
+        )
+        .expect("write claude settings");
+
+        let loader = ConfigLoader::new(&workspace, &claw_home);
+        let show = super::render_mcp_report_for(&loader, &workspace, Some("show claude-home"))
+            .expect("mcp show");
+        assert!(show.contains("Name              claude-home"));
+        assert!(show.contains("Command           uvx"));
+
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
