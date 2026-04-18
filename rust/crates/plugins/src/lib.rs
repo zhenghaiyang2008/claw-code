@@ -3724,6 +3724,60 @@ mod tests {
         let _ = fs::remove_dir_all(home_root);
     }
 
+    #[test]
+    fn external_directory_plugins_outrank_claude_home_plugins_with_same_id() {
+        let _guard = env_guard();
+        let config_home = temp_dir("claude-home-plugin-precedence-config");
+        let bundled_root = temp_dir("claude-home-plugin-precedence-bundled");
+        let external_root = temp_dir("claude-home-plugin-precedence-external");
+        let home_root = temp_dir("claude-home-plugin-precedence-home");
+        let claude_plugin_root = home_root.join(".claude").join("plugins").join("home-demo");
+        let external_plugin_root = external_root.join("home-demo");
+
+        write_file(
+            claude_plugin_root.join(MANIFEST_RELATIVE_PATH).as_path(),
+            r#"{
+  "name": "home-demo",
+  "version": "1.0.0",
+  "description": "Claude home plugin",
+  "permissions": ["read"]
+}"#,
+        );
+        write_external_plugin(&external_plugin_root, "home-demo", "2.0.0");
+
+        let original_home = std::env::var_os("HOME");
+        let original_claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
+        std::env::set_var("HOME", &home_root);
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+        let mut config = PluginManagerConfig::new(&config_home);
+        config.bundled_root = Some(bundled_root.clone());
+        config.external_dirs = vec![external_root.clone()];
+        let manager = PluginManager::new(config);
+        let plugins = manager.list_plugins().expect("plugins should list");
+
+        let matching = plugins
+            .iter()
+            .filter(|plugin| plugin.metadata.id == "home-demo@external")
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].metadata.version, "2.0.0");
+        assert!(!matching[0].metadata.source.starts_with("claude-home:"));
+
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_claude_config_dir {
+            Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(bundled_root);
+        let _ = fs::remove_dir_all(external_root);
+        let _ = fs::remove_dir_all(home_root);
+    }
+
     /// Regression test for ROADMAP #41: verify that `CLAW_CONFIG_HOME` isolation prevents
     /// host `~/.claw/plugins/` from bleeding into test runs.
     #[test]

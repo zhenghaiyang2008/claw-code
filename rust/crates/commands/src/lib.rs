@@ -2648,15 +2648,12 @@ pub fn render_plugins_report(plugins: &[PluginSummary]) -> String {
         return lines.join("\n");
     }
     for plugin in plugins {
-        let enabled = if plugin.enabled {
-            "enabled"
-        } else {
-            "disabled"
-        };
+        let enabled = plugin_render_status(plugin);
         lines.push(format!(
-            "  {name:<20} v{version:<10} {enabled}",
+            "  {name:<20} v{version:<10} {enabled}{source_suffix}",
             name = plugin.metadata.name,
             version = plugin.metadata.version,
+            source_suffix = plugin_render_source_suffix(plugin),
         ));
     }
     lines.join("\n")
@@ -2674,15 +2671,12 @@ pub fn render_plugins_report_with_failures(
         lines.push("  No plugins installed.".to_string());
     } else {
         for plugin in plugins {
-            let enabled = if plugin.enabled {
-                "enabled"
-            } else {
-                "disabled"
-            };
+            let enabled = plugin_render_status(plugin);
             lines.push(format!(
-                "  {name:<20} v{version:<10} {enabled}",
+                "  {name:<20} v{version:<10} {enabled}{source_suffix}",
                 name = plugin.metadata.name,
                 version = plugin.metadata.version,
+                source_suffix = plugin_render_source_suffix(plugin),
             ));
         }
     }
@@ -2702,6 +2696,24 @@ pub fn render_plugins_report_with_failures(
     }
 
     lines.join("\n")
+}
+
+fn plugin_render_status(plugin: &PluginSummary) -> &'static str {
+    if plugin.metadata.source.starts_with("claude-home:") && !plugin.enabled {
+        "discovered"
+    } else if plugin.enabled {
+        "enabled"
+    } else {
+        "disabled"
+    }
+}
+
+fn plugin_render_source_suffix(plugin: &PluginSummary) -> &'static str {
+    if plugin.metadata.source.starts_with("claude-home:") {
+        " · claude-home"
+    } else {
+        ""
+    }
 }
 
 fn render_plugin_install_report(plugin_id: &str, plugin: Option<&PluginSummary>) -> String {
@@ -4937,6 +4949,19 @@ mod tests {
                 },
                 enabled: false,
             },
+            PluginSummary {
+                metadata: PluginMetadata {
+                    id: "home-demo@external".to_string(),
+                    name: "home-demo".to_string(),
+                    version: "1.0.0".to_string(),
+                    description: "Claude home plugin".to_string(),
+                    kind: PluginKind::External,
+                    source: "claude-home:/tmp/home-demo".to_string(),
+                    default_enabled: false,
+                    root: None,
+                },
+                enabled: false,
+            },
         ]);
 
         assert!(rendered.contains("demo"));
@@ -4945,6 +4970,9 @@ mod tests {
         assert!(rendered.contains("sample"));
         assert!(rendered.contains("v0.9.0"));
         assert!(rendered.contains("disabled"));
+        assert!(rendered.contains("home-demo"));
+        assert!(rendered.contains("discovered"));
+        assert!(rendered.contains("claude-home"));
     }
 
     #[test]
