@@ -197,6 +197,10 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         name: "trustedRoots",
         expected: FieldType::StringArray,
     },
+    FieldSpec {
+        name: "includeCoAuthoredBy",
+        expected: FieldType::Bool,
+    },
 ];
 
 const HOOKS_FIELDS: &[FieldSpec] = &[
@@ -360,6 +364,7 @@ fn validate_object_keys(
     prefix: &str,
     source: &str,
     path_display: &str,
+    allow_unknown_keys: bool,
 ) -> ValidationResult {
     let mut result = ValidationResult {
         errors: Vec::new(),
@@ -390,7 +395,7 @@ fn validate_object_keys(
             }
         } else if DEPRECATED_FIELDS.iter().any(|d| d.name == key) {
             // Deprecated key — handled separately, not an unknown-key error.
-        } else {
+        } else if !allow_unknown_keys {
             // Unknown key.
             let suggestion = suggest_field(key, &known_names);
             result.errors.push(ConfigDiagnostic {
@@ -403,6 +408,12 @@ fn validate_object_keys(
     }
 
     result
+}
+
+fn is_claude_compat_settings_path(file_path: &Path) -> bool {
+    let path = file_path.to_string_lossy().replace('\\', "/");
+    path.ends_with("/.claude/settings.json") || path.ends_with("/settings.json")
+        && path.contains("claude")
 }
 
 fn suggest_field(input: &str, candidates: &[&str]) -> Option<String> {
@@ -451,7 +462,15 @@ pub fn validate_config_file(
     file_path: &Path,
 ) -> ValidationResult {
     let path_display = file_path.display().to_string();
-    let mut result = validate_object_keys(object, TOP_LEVEL_FIELDS, "", source, &path_display);
+    let allow_unknown_keys = is_claude_compat_settings_path(file_path);
+    let mut result = validate_object_keys(
+        object,
+        TOP_LEVEL_FIELDS,
+        "",
+        source,
+        &path_display,
+        allow_unknown_keys,
+    );
 
     // Check deprecated fields.
     for deprecated in DEPRECATED_FIELDS {
@@ -475,6 +494,7 @@ pub fn validate_config_file(
             "hooks",
             source,
             &path_display,
+            allow_unknown_keys,
         ));
     }
     if let Some(permissions) = object.get("permissions").and_then(JsonValue::as_object) {
@@ -484,6 +504,7 @@ pub fn validate_config_file(
             "permissions",
             source,
             &path_display,
+            allow_unknown_keys,
         ));
     }
     if let Some(plugins) = object.get("plugins").and_then(JsonValue::as_object) {
@@ -493,6 +514,7 @@ pub fn validate_config_file(
             "plugins",
             source,
             &path_display,
+            allow_unknown_keys,
         ));
     }
     if let Some(sandbox) = object.get("sandbox").and_then(JsonValue::as_object) {
@@ -502,6 +524,7 @@ pub fn validate_config_file(
             "sandbox",
             source,
             &path_display,
+            allow_unknown_keys,
         ));
     }
     if let Some(oauth) = object.get("oauth").and_then(JsonValue::as_object) {
@@ -511,6 +534,7 @@ pub fn validate_config_file(
             "oauth",
             source,
             &path_display,
+            allow_unknown_keys,
         ));
     }
 
@@ -760,6 +784,7 @@ mod tests {
         // given
         let source = r#"{
   "model": "opus",
+  "includeCoAuthoredBy": true,
   "hooks": {"PreToolUse": ["guard"]},
   "permissions": {"defaultMode": "plan", "allow": ["Read"]},
   "mcpServers": {},
@@ -774,6 +799,58 @@ mod tests {
         // then
         assert!(result.is_ok());
         assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn accepts_claude_include_co_authored_by_flag() {
+        // given
+        let source = r#"{"includeCoAuthoredBy": true}"#;
+        let parsed = JsonValue::parse(source).expect("valid json");
+        let object = parsed.as_object().expect("object");
+
+        // when
+        let result = validate_config_file(object, source, &test_path());
+
+        // then
+        assert!(result.errors.is_empty(), "unexpected errors: {result:?}");
+    }
+
+    #[test]
+    fn ignores_unknown_claude_specific_top_level_keys_in_claude_settings() {
+        // given
+        let source = r#"{"outputStyle":"compact","statusLine":{"type":"command"},"skipDangerousModePermissionPrompt":true}"#;
+        let parsed = JsonValue::parse(source).expect("valid json");
+        let object = parsed.as_object().expect("object");
+        let path = PathBuf::from("/home/coder/.claude/settings.json");
+
+        // when
+        let result = validate_config_file(object, source, &path);
+
+        // then
+        assert!(result.errors.is_empty(), "unexpected errors: {result:?}");
+    }
+
+    #[test]
+    fn still_reports_wrong_type_for_supported_claude_settings_keys() {
+        // given
+        let source = r#"{"model":42}"#;
+        let parsed = JsonValue::parse(source).expect("valid json");
+        let object = parsed.as_object().expect("object");
+        let path = PathBuf::from("/home/coder/.claude/settings.json");
+
+        // when
+        let result = validate_config_file(object, source, &path);
+
+        // then
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].field, "model");
+        assert!(matches!(
+            result.errors[0].kind,
+            DiagnosticKind::WrongType {
+                expected: "a string",
+                got: "a number"
+            }
+        ));
     }
 
     #[test]
