@@ -3749,7 +3749,7 @@ fn render_skills_usage(unexpected: Option<&str>) -> String {
         "  Direct CLI       claw skills [list|install <path>|help|<skill> [args]]".to_string(),
         "  Invoke           /skills help overview -> $help overview".to_string(),
         "  Install root     $CLAW_CONFIG_HOME/skills or ~/.claw/skills".to_string(),
-        "  Sources          .claw/skills, .omc/skills, .agents/skills, .codex/skills, .claude/skills, ~/.claw/skills, ~/.omc/skills, ~/.claude/skills/omc-learned, ~/.codex/skills, ~/.claude/skills, legacy /commands".to_string(),
+        "  Sources          .claw/skills, .omc/skills, .agents/skills, .codex/skills, .claude/skills, ~/.claw/skills, ~/.omc/skills, ~/.codex/skills, ~/.claude/skills, ~/.claude/skills/omc-learned, CLAUDE_CONFIG_DIR/skills, legacy /commands".to_string(),
     ];
     if let Some(args) = unexpected {
         lines.push(format!("  Unexpected       {args}"));
@@ -3775,9 +3775,10 @@ fn render_skills_usage_json(unexpected: Option<&str>) -> Value {
                 ".claude/skills",
                 "~/.claw/skills",
                 "~/.omc/skills",
-                "~/.claude/skills/omc-learned",
                 "~/.codex/skills",
                 "~/.claude/skills",
+                "~/.claude/skills/omc-learned",
+                "CLAUDE_CONFIG_DIR/skills",
                 "legacy /commands",
                 "legacy fallback dirs still load automatically"
             ],
@@ -3896,9 +3897,8 @@ fn definition_source_id(source: DefinitionSource) -> &'static str {
         DefinitionSource::UserClawConfigHome | DefinitionSource::UserCodexHome => {
             "user_claw_config_home"
         }
-        DefinitionSource::UserClaw | DefinitionSource::UserCodex | DefinitionSource::UserClaude => {
-            "user_claw"
-        }
+        DefinitionSource::UserClaude => "user_claude",
+        DefinitionSource::UserClaw | DefinitionSource::UserCodex => "user_claw",
     }
 }
 
@@ -5132,6 +5132,47 @@ mod tests {
     }
 
     #[test]
+    fn lists_claude_home_skills_and_legacy_commands_with_shadowing() {
+        let workspace = temp_dir("claude-home-skills");
+        let project_skills = workspace.join(".claw").join("skills");
+        let user_home = temp_dir("claude-home-user");
+        let user_skills = user_home.join(".claude").join("skills");
+        let user_commands = user_home.join(".claude").join("commands");
+
+        write_skill(&project_skills, "plan", "Project plan skill");
+        write_skill(&user_skills, "plan", "User Claude plan skill");
+        write_skill(&user_skills, "ralph", "User Claude ralph skill");
+        write_legacy_command(&user_commands, "handoff", "Claude command handoff");
+
+        let roots = vec![
+            SkillRoot {
+                source: DefinitionSource::ProjectClaw,
+                path: project_skills,
+                origin: SkillOrigin::SkillsDir,
+            },
+            SkillRoot {
+                source: DefinitionSource::UserClaude,
+                path: user_skills,
+                origin: SkillOrigin::SkillsDir,
+            },
+            SkillRoot {
+                source: DefinitionSource::UserClaude,
+                path: user_commands,
+                origin: SkillOrigin::LegacyCommandsDir,
+            },
+        ];
+        let report =
+            render_skills_report(&load_skills_from_roots(&roots).expect("skills should load"));
+
+        assert!(report.contains("ralph · User Claude ralph skill"));
+        assert!(report.contains("handoff · Claude command handoff · legacy /commands"));
+        assert!(report.contains("(shadowed by Project roots) plan · User Claude plan skill"));
+
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(user_home);
+    }
+
+    #[test]
     fn resolves_project_skills_and_legacy_commands_from_shared_registry() {
         let workspace = temp_dir("resolve-project-skills");
         let project_skills = workspace.join(".claw").join("skills");
@@ -5207,6 +5248,37 @@ mod tests {
     }
 
     #[test]
+    fn renders_user_claude_skill_sources_as_distinct_ids() {
+        let user_home = temp_dir("skills-json-claude-home");
+        let user_skills = user_home.join(".claude").join("skills");
+        let user_commands = user_home.join(".claude").join("commands");
+
+        write_skill(&user_skills, "ralph", "User Claude ralph skill");
+        write_legacy_command(&user_commands, "handoff", "Claude command handoff");
+
+        let roots = vec![
+            SkillRoot {
+                source: DefinitionSource::UserClaude,
+                path: user_skills,
+                origin: SkillOrigin::SkillsDir,
+            },
+            SkillRoot {
+                source: DefinitionSource::UserClaude,
+                path: user_commands,
+                origin: SkillOrigin::LegacyCommandsDir,
+            },
+        ];
+        let report = super::render_skills_report_json(
+            &load_skills_from_roots(&roots).expect("skills should load"),
+        );
+
+        assert_eq!(report["skills"][0]["source"]["id"], "user_claude");
+        assert_eq!(report["skills"][1]["source"]["id"], "user_claude");
+
+        let _ = fs::remove_dir_all(user_home);
+    }
+
+    #[test]
     fn agents_and_skills_usage_support_help_and_unexpected_args() {
         let cwd = temp_dir("slash-usage");
 
@@ -5230,6 +5302,7 @@ mod tests {
         assert!(skills_help.contains("Install root     $CLAW_CONFIG_HOME/skills or ~/.claw/skills"));
         assert!(skills_help.contains(".omc/skills"));
         assert!(skills_help.contains(".agents/skills"));
+        assert!(skills_help.contains("CLAUDE_CONFIG_DIR/skills"));
         assert!(skills_help.contains("~/.claude/skills/omc-learned"));
         assert!(skills_help.contains("legacy /commands"));
 
@@ -5259,6 +5332,7 @@ mod tests {
         assert!(sources.iter().any(|value| value == ".omc/skills"));
         assert!(sources.iter().any(|value| value == ".agents/skills"));
         assert!(sources.iter().any(|value| value == "~/.omc/skills"));
+        assert!(sources.iter().any(|value| value == "CLAUDE_CONFIG_DIR/skills"));
         assert!(sources
             .iter()
             .any(|value| value == "~/.claude/skills/omc-learned"));
