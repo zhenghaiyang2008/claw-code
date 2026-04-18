@@ -13,6 +13,7 @@ mod config;
 pub mod config_validate;
 mod conversation;
 pub mod deep_interview;
+pub mod external_team_runtime;
 mod file_ops;
 mod git_context;
 pub mod green_contract;
@@ -84,6 +85,7 @@ pub use deep_interview::{
     DeepInterviewError, DeepInterviewInitRequest, DeepInterviewRound, DeepInterviewSessionArtifact,
     DeepInterviewState, DEEP_INTERVIEW_MODE,
 };
+pub use external_team_runtime::{normalize_external_workers, ExternalTeamWorker};
 pub use file_ops::{
     edit_file, glob_search, grep_search, read_file, write_file, EditFileOutput, GlobSearchOutput,
     GrepSearchInput, GrepSearchOutput, ReadFileOutput, StructuredPatchHunk, TextFilePayload,

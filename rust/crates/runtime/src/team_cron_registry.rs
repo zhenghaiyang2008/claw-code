@@ -15,6 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::external_team_runtime::{normalize_external_workers, ExternalTeamWorker};
 use crate::omc_compat::{build_omc_handoff, OmcCompatHandoff};
 
 static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -76,6 +77,8 @@ pub struct Team {
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff: Option<OmcCompatHandoff>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_workers: Vec<ExternalTeamWorker>,
     pub task_ids: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -185,6 +188,7 @@ impl TeamRegistry {
                 .unwrap_or_else(|| String::from("created")),
             session_id: normalize_optional_text(metadata.session_id),
             handoff: Some(build_team_handoff(&team_id)),
+            external_workers: Vec::new(),
             task_ids,
             created_at: timestamp.clone(),
             updated_at: timestamp,
@@ -223,6 +227,7 @@ impl TeamRegistry {
         self.update_team(team_id, |team| {
             team.status = TeamStatus::Deleted;
             team.phase = String::from("deleted");
+            team.external_workers.clear();
             Ok(())
         })
     }
@@ -235,7 +240,31 @@ impl TeamRegistry {
         self.update_team(team_id, move |team| {
             team.status = TeamStatus::Deleted;
             team.phase = String::from("deleted");
+            team.external_workers.clear();
             team.task_ids = task_ids;
+            Ok(())
+        })
+    }
+
+    pub fn sync_external_workers(
+        &self,
+        team_id: &str,
+        workers: Vec<ExternalTeamWorker>,
+        metadata: TeamRuntimeMetadata,
+    ) -> Result<Team, String> {
+        self.update_team(team_id, move |team| {
+            team.external_workers = normalize_external_workers(workers)?;
+            if !team.external_workers.is_empty() && matches!(team.status, TeamStatus::Created) {
+                team.status = TeamStatus::Running;
+            }
+            if let Some(phase) = normalize_optional_text(metadata.phase) {
+                team.phase = phase;
+            } else if !team.external_workers.is_empty() {
+                team.phase = String::from("external_running");
+            }
+            if let Some(session_id) = normalize_optional_text(metadata.session_id) {
+                team.session_id = Some(session_id);
+            }
             Ok(())
         })
     }
@@ -839,6 +868,50 @@ mod tests {
             restored.handoff.as_ref().map(|handoff| handoff.handoff_path.as_str()),
             Some(expected_handoff_path.as_str())
         );
+    }
+
+    #[test]
+    fn persists_external_team_workers_on_existing_team_records() {
+        let workspace = TestWorkspace::new();
+        let registry = workspace.registry();
+        let created = registry
+            .create_with_metadata(
+                "Dispatch Lane",
+                vec!["task_010".into()],
+                TeamRuntimeMetadata {
+                    phase: Some("dispatch".to_string()),
+                    session_id: Some("session-42".to_string()),
+                },
+            )
+            .expect("team with metadata should persist");
+
+        let updated = registry
+            .sync_external_workers(
+                &created.team_id,
+                vec![ExternalTeamWorker {
+                    worker_id: " worker-1 ".to_string(),
+                    cli: " codex ".to_string(),
+                    pane_id: Some(" %1 ".to_string()),
+                    status: " running ".to_string(),
+                }],
+                TeamRuntimeMetadata {
+                    phase: Some("tmux_running".to_string()),
+                    session_id: Some("session-99".to_string()),
+                },
+            )
+            .expect("external worker bridge should persist");
+
+        assert_eq!(updated.status, TeamStatus::Running);
+        assert_eq!(updated.phase, "tmux_running");
+        assert_eq!(updated.session_id.as_deref(), Some("session-99"));
+        assert_eq!(updated.external_workers.len(), 1);
+        assert_eq!(updated.external_workers[0].worker_id, "worker-1");
+
+        let restored = workspace
+            .registry()
+            .get(&created.team_id)
+            .expect("team should exist");
+        assert_eq!(restored.external_workers, updated.external_workers);
     }
 
     #[test]

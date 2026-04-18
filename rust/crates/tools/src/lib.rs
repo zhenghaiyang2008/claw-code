@@ -14,7 +14,7 @@ use runtime::{
     append_deep_interview_round, check_freshness, dedupe_superseded_commit_events,
     deep_interview::DeepInterviewSessionArtifact, initialize_deep_interview_session,
     read_deep_interview_state, DeepInterviewAppendRequest, DeepInterviewInitRequest,
-    DEEP_INTERVIEW_MODE, edit_file, execute_bash, glob_search, grep_search, load_system_prompt,
+    ExternalTeamWorker, DEEP_INTERVIEW_MODE, edit_file, execute_bash, glob_search, grep_search, load_system_prompt,
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     mode_state::{ModeStateRecord, ModeStateStore},
@@ -1134,6 +1134,35 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
+            name: "TeamExternalSync",
+            description: "Record external/tmux worker state on an existing persisted team.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "team_id": { "type": "string" },
+                    "phase": { "type": "string" },
+                    "session_id": { "type": "string" },
+                    "workers": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "worker_id": { "type": "string" },
+                                "cli": { "type": "string" },
+                                "pane_id": { "type": "string" },
+                                "status": { "type": "string" }
+                            },
+                            "required": ["worker_id", "cli", "status"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["team_id", "workers"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
             name: "CronCreate",
             description: "Create a scheduled recurring task.",
             input_schema: json!({
@@ -1389,6 +1418,7 @@ fn execute_tool_with_enforcer(
         "TeamGet" => from_value::<TeamIdInput>(input).and_then(run_team_get),
         "TeamList" => run_team_list(input.clone()),
         "TeamDelete" => from_value::<TeamDeleteInput>(input).and_then(run_team_delete),
+        "TeamExternalSync" => from_value::<TeamExternalSyncInput>(input).and_then(run_team_external_sync),
         "CronCreate" => from_value::<CronCreateInput>(input).and_then(run_cron_create),
         "CronDelete" => from_value::<CronDeleteInput>(input).and_then(run_cron_delete),
         "CronList" => run_cron_list(input.clone()),
@@ -1860,6 +1890,7 @@ fn run_team_create(input: TeamCreateInput) -> Result<String, String> {
         "name": team.name,
         "task_count": team.task_ids.len(),
         "task_ids": team.task_ids,
+        "external_worker_count": team.external_workers.len(),
         "status": team.status,
         "phase": team.phase,
         "session_id": team.session_id,
@@ -1880,6 +1911,8 @@ fn run_team_get(input: TeamIdInput) -> Result<String, String> {
             "session_id": team.session_id,
             "task_ids": team.task_ids,
             "task_count": team.task_ids.len(),
+            "external_workers": team.external_workers,
+            "external_worker_count": team.external_workers.len(),
             "created_at": team.created_at,
             "updated_at": team.updated_at
         })),
@@ -1901,6 +1934,8 @@ fn run_team_list(_input: Value) -> Result<String, String> {
                 "session_id": team.session_id,
                 "task_ids": team.task_ids,
                 "task_count": team.task_ids.len(),
+                "external_workers": team.external_workers,
+                "external_worker_count": team.external_workers.len(),
                 "created_at": team.created_at,
                 "updated_at": team.updated_at
             })
@@ -1940,6 +1975,8 @@ fn run_team_delete(input: TeamDeleteInput) -> Result<String, String> {
             "phase": team.phase,
             "session_id": team.session_id,
             "task_ids": team.task_ids,
+            "external_workers": team.external_workers,
+            "external_worker_count": team.external_workers.len(),
             "created_at": team.created_at,
             "updated_at": team.updated_at,
             "message": "Team deleted"
@@ -1953,6 +1990,29 @@ fn run_team_delete(input: TeamDeleteInput) -> Result<String, String> {
             ))
         }
     }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_team_external_sync(input: TeamExternalSyncInput) -> Result<String, String> {
+    let team_registry = current_workspace_team_registry()?;
+    let team = team_registry.sync_external_workers(
+        &input.team_id,
+        input.workers,
+        TeamRuntimeMetadata {
+            phase: input.phase,
+            session_id: input.session_id,
+        },
+    )?;
+    to_pretty_json(json!({
+        "team_id": team.team_id,
+        "name": team.name,
+        "status": team.status,
+        "phase": team.phase,
+        "session_id": team.session_id,
+        "external_workers": team.external_workers,
+        "external_worker_count": team.external_workers.len(),
+        "updated_at": team.updated_at
+    }))
 }
 
 fn unassign_owned_team_tasks<F, G>(
@@ -2958,6 +3018,17 @@ struct TeamIdInput {
 #[serde(deny_unknown_fields)]
 struct TeamDeleteInput {
     team_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TeamExternalSyncInput {
+    team_id: String,
+    #[serde(default)]
+    phase: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    workers: Vec<ExternalTeamWorker>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6662,17 +6733,20 @@ mod tests {
         final_assistant_text, global_cron_registry, maybe_commit_provenance, mvp_tool_specs,
         permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
         run_task_create, run_task_get, run_task_output, run_task_packet, run_task_update,
-        run_team_create, run_team_delete, unassign_owned_team_tasks, AgentInput, AgentJob,
+        run_team_create, run_team_delete, run_team_external_sync, unassign_owned_team_tasks,
+        AgentInput, AgentJob,
         GlobalToolRegistry,
         LaneEventName, LaneFailureClass, ProviderRuntimeClient, SubagentToolExecutor,
         TaskCreateInput, TaskIdInput, TaskUpdateInput, TeamCreateInput, TeamDeleteInput,
+        TeamExternalSyncInput,
         TeamTaskInput,
     };
     use api::OutputContentBlock;
     use runtime::ProviderFallbackConfig;
     use runtime::{
         permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
-        PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket, ToolExecutor,
+        ExternalTeamWorker, PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket,
+        ToolExecutor,
     };
     use serde_json::json;
 
@@ -10635,6 +10709,60 @@ printf 'pwsh:%s' "$1"
             team_create.input_schema["properties"]["tasks"]["items"]["properties"]["prompt"]
                 .is_null()
         );
+    }
+
+    #[test]
+    fn team_external_sync_persists_external_worker_bridge_state() {
+        let _guard = env_guard();
+        let workspace = temp_path("team-external-sync");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("set workspace");
+
+        let task = run_task_create(TaskCreateInput {
+            prompt: "external sync task".to_string(),
+            description: Some("team bridge".to_string()),
+            session_id: Some("session-team".to_string()),
+            dependencies: Vec::new(),
+            artifacts: Vec::new(),
+        })
+        .expect("task should be created");
+        let task_json: serde_json::Value = serde_json::from_str(&task).expect("json");
+        let task_id = task_json["task_id"].as_str().expect("task id").to_string();
+
+        let created = run_team_create(TeamCreateInput {
+            name: "tmux-team".to_string(),
+            tasks: vec![TeamTaskInput { task_id }],
+        })
+        .expect("team create should succeed");
+        let created_json: serde_json::Value = serde_json::from_str(&created).expect("json");
+        let team_id = created_json["team_id"].as_str().expect("team id").to_string();
+
+        let synced = run_team_external_sync(TeamExternalSyncInput {
+            team_id: team_id.clone(),
+            phase: Some("tmux_running".to_string()),
+            session_id: Some("session-external".to_string()),
+            workers: vec![ExternalTeamWorker {
+                worker_id: " worker-1 ".to_string(),
+                cli: " codex ".to_string(),
+                pane_id: Some(" %1 ".to_string()),
+                status: " running ".to_string(),
+            }],
+        })
+        .expect("external sync should succeed");
+        let synced_json: serde_json::Value = serde_json::from_str(&synced).expect("json");
+        assert_eq!(synced_json["external_worker_count"], 1);
+        assert_eq!(synced_json["phase"], "tmux_running");
+        assert_eq!(synced_json["session_id"], "session-external");
+
+        let fetched = execute_tool("TeamGet", &json!({ "team_id": team_id })).expect("team get");
+        let fetched_json: serde_json::Value = serde_json::from_str(&fetched).expect("json");
+        assert_eq!(fetched_json["external_worker_count"], 1);
+        assert_eq!(fetched_json["external_workers"][0]["worker_id"], "worker-1");
+        assert_eq!(fetched_json["external_workers"][0]["pane_id"], "%1");
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(&workspace);
     }
 
     #[test]
